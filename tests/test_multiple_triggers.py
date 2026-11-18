@@ -42,7 +42,7 @@ class MultipleTriggerTests(unittest.TestCase):
         cls.consume = staticmethod(jax.jit(core.use_count))
 
     def pending(self, code):
-        s = self.state._replace(cid=self.state.cid.at[0].set(code - 1))
+        s = core.with_cid(self.bank, self.state, self.state.cid.at[0].set(code - 1))
         s = core.raise_ev(s, core.EV_SUMMON, jnp.arange(80) == 0, 0)
         return self.collect(self.bank, s)
 

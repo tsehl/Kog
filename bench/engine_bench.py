@@ -7,6 +7,8 @@ ENGINE_DIR: directory containing core.py and cards.py (current engine, or an old
 Extra Deck (isolates the engine cost).
 A decision = an action chosen by the policy (the forced actions returned by step_batch are not counted).
 Finished games are replaced by new games (pre-generated pool), to keep the batch full.
+--profile DIR: after the measurement, records a profiler trace of --profile-calls calls in DIR (summarise it with
+bench/trace_summary.py). The memory and cost analysis of the compiled step_batch is always printed.
 --compile-only: compile without measuring. Several engines on the same GPU: run the --compile-only runs in parallel
 (XLA_PYTHON_CLIENT_PREALLOCATE=false), then the measurements one by one, which read the cache (YGO_JAX_CACHE).
 """
@@ -26,6 +28,8 @@ ap.add_argument("--bank-arg", action="store_true", help="bank passed as an argum
                 "instead of a compile-time constant")
 ap.add_argument("--proc", type=int, default=-1, help="procedural bank of seed X (gen/cardgen.py, 400 + 80 cards, "
                 "random decks of 40 + 15) instead of the real cards")
+ap.add_argument("--profile", default="", help="directory for a profiler trace of a few calls after the measurement")
+ap.add_argument("--profile-calls", type=int, default=5)
 args = ap.parse_args()
 sys.path.insert(0, args.engine)
 
@@ -112,6 +116,32 @@ def run(b):
         w = lambda x, y: jnp.where(d.reshape(d.shape + (1,) * (x.ndim - 1)), y, x)
         return jax.tree.map(w, s, pool), w(m, pm), jnp.where(d, -1, f)
 
+    # compile ahead of time: the compiled object gives the memory / cost analysis, and the calls below use it
+    t1 = time.time()
+    if args.bank_arg:
+        comp0 = sb0.lower(bank, s, f).compile()
+        comp = lambda s, a: comp0(bank, s, a)
+    else:
+        comp0 = sb.lower(s, f).compile()
+        comp = comp0
+    print(f"  B={b}: step_batch compiled in {time.time() - t1:.0f} s (new_game + legal {t_new:.0f} s)", flush=True)
+    try:
+        ma = comp0.memory_analysis()
+        mb = lambda x: f"{x / 2**20:.0f} MB"
+        print(f"  B={b}: memory: arguments {mb(ma.argument_size_in_bytes)}, outputs {mb(ma.output_size_in_bytes)}, "
+              f"temporaries {mb(ma.temp_size_in_bytes)}, generated code {mb(ma.generated_code_size_in_bytes)}",
+              flush=True)
+    except Exception as e:  # noqa: BLE001 (not available on every backend)
+        print(f"  B={b}: memory analysis unavailable ({e})", flush=True)
+    try:
+        ca = comp0.cost_analysis()
+        ca = ca[0] if isinstance(ca, (list, tuple)) else ca
+        print(f"  B={b}: cost analysis: {ca.get('flops', 0):.3g} flops, {ca.get('bytes accessed', 0):.3g} bytes "
+              "accessed (while-loop bodies counted once)", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  B={b}: cost analysis unavailable ({e})", flush=True)
+    sb = comp
+
     kk = jax.random.fold_in(key, 5)
     times, dec = [], 0
     for i in range(args.calls + 3):
@@ -121,7 +151,7 @@ def run(b):
         jax.block_until_ready(f)
         dt = time.time() - t1
         if i == 0:
-            print(f"  B={b}: step_batch compilation + 1st call {dt:.0f} s (new_game + legal {t_new:.0f} s)", flush=True)
+            print(f"  B={b}: 1st call {dt:.1f} s", flush=True)
         if i >= 3:
             times.append(dt)
             dec += int(nd)
@@ -129,6 +159,15 @@ def run(b):
     tot = sum(times)
     print(f"  B={b}: {dec / tot:,.0f} decisions/s ; {1000 * tot / len(times):.1f} ms/call ; "
           f"{dec / len(times):.0f} decisions/call", flush=True)
+    if args.profile:
+        out = f"{args.profile}/B{b}"
+        with jax.profiler.trace(out, create_perfetto_trace=True):
+            for i in range(args.profile_calls):
+                a, _ = policy(jax.random.fold_in(kk, 10_000 + i), m, f, s.done)
+                s, m, f = sb(s, a)
+                jax.block_until_ready(f)
+                s, m, f = refill(s, m, f, pool, pm)
+        print(f"  B={b}: trace of {args.profile_calls} calls in {out} (bench/trace_summary.py {out})", flush=True)
 
 
 for b in map(int, args.b.split(",")):

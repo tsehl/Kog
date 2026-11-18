@@ -84,13 +84,14 @@ def perturb(s, p):
     mons = np.where(np.asarray(bank.ctype) & core.TYPE_MONSTER)[0]
     cid[h] = np.select([s.zone[h] == core.Z_SZONE, s.zone[h] == core.Z_MZONE],
                        [rng.choice(spells, len(h)), rng.choice(mons, len(h))], rng.integers(0, CT, len(h)))
-    s = s._replace(cid=cid)
+    s = core.with_cid(bank, s, jnp.asarray(cid))
     perm = rng.permutation(N)                      # renumbering of the slots
     inv = np.argsort(perm)
     sl = lambda x: np.where(x >= 0, inv[x], -1)
     s = s._replace(**{f: getattr(s, f)[perm] for f in ("cid", "zone", "seq", "ctrl", "owner", "pos", "st", "pzone", "suminfo", "reason", "tg", "tg_e",
                                                   "atk_c", "df_c", "batk_c", "en_t", "cav", "cav_t", "fl_c", "ib_c",
-                                                  "proc", "fz_c", "rz_c", "sz_c", "xz_c", "lz_c", "uid")},
+                                                  "proc", "fz_c", "rz_c", "sz_c", "xz_c", "lz_c", "uid",
+                                                  *("k_" + f for f in core.SLOT_FIELDS))},
                    ov_par=sl(s.ov_par)[perm], eq_t=sl(s.eq_t)[perm], eq_mv=s.eq_mv[perm], tm_m=s.tm_m[:, perm], tm_v=s.tm_v[:, perm],
                    pend=sl(s.pend), ch_src=sl(s.ch_src), atk=sl(s.atk), atk_tgt=sl(s.atk_tgt), lk_src=sl(s.lk_src),
                    reg=s.reg[:, perm], lk_reg=s.lk_reg[:, :, perm], ch_targets=s.ch_targets[perm], lk_targets=s.lk_targets[:, perm], mv=s.mv[perm], ev_g=s.ev_g[:, perm], tev=s.tev[:, perm], tew=s.tew[:, perm], teg=s.teg[:, perm])
@@ -125,7 +126,7 @@ for i in rng.choice(len(samples), 100, replace=False):
         continue
     cid = np.array(s.cid)
     cid[hand[0]] = (cid[hand[0]] + 1) % CT
-    o1, o2 = observe(bank, s, p), observe(bank, s._replace(cid=jnp.asarray(cid)), p)
+    o1, o2 = observe(bank, s, p), observe(bank, core.with_cid(bank, s, jnp.asarray(cid)), p)
     changed += not np.array_equal(o1.cid, o2.cid)
 print(f"3. ok: {changed} positive controls detected" if changed else "3. FAILED: nothing detected")
 
@@ -153,7 +154,7 @@ for i in rng.choice(len(samples), 200, replace=False):
     if len(dk):
         cid = cid0.copy()
         cid[dk[0]] = (cid[dk[0]] + 1) % CT
-        o2 = observe(bank, s._replace(cid=jnp.asarray(cid)), p)
+        o2 = observe(bank, core.with_cid(bank, s, jnp.asarray(cid)), p)
         dk_changed += not np.array_equal(o1.deck, o2.deck)
 print(f"4. ok: deck = public subtraction on {nsub} states; {dk_changed} positive controls")
 assert dk_changed, "4. FAILED"

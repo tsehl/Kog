@@ -482,9 +482,43 @@ class State(NamedTuple):
     ps_used: jnp.ndarray  # Pendulum Summon done this turn (flag 10000000 of proc_pendulum.lua)
     uid: jnp.ndarray     # [N] card creation order (ygopro's cardid: deck 0, Extra 0, deck 1, Extra 1)
     ovf: jnp.ndarray     # table overflow (bits): 1 = more than KM active continuous effects, 2 = more than TM modifiers
+    # Per-slot copy of the card attributes (bank.X[cid]). A slot keeps its card for the whole game, so these are
+    # written once by new_game (and by with_cid). Reading them is elementwise; bank.X[s.cid] was a gather over the
+    # N slots, the most expensive operation of the engine on TPU.
+    k_ctype: jnp.ndarray
+    k_level: jnp.ndarray
+    k_attr: jnp.ndarray
+    k_race: jnp.ndarray
+    k_code: jnp.ndarray
+    k_setcode: jnp.ndarray
+    k_erl: jnp.ndarray
+    k_fmn: jnp.ndarray
+    k_xct: jnp.ndarray
+    k_syn: jnp.ndarray
+    k_lmax: jnp.ndarray
+    k_lmark: jnp.ndarray
+    k_ekind: jnp.ndarray
+    k_erng: jnp.ndarray
+    k_emod: jnp.ndarray
+    k_etrig: jnp.ndarray
+    k_edmg: jnp.ndarray
+    k_submat: jnp.ndarray
+    k_atk: jnp.ndarray
+    k_df: jnp.ndarray
 
 
 I32 = jnp.int32
+SLOT_FIELDS = ("ctype", "level", "attr", "race", "code", "setcode", "erl", "fmn", "xct", "syn", "lmax", "lmark", "ekind", "erng", "emod", "etrig", "edmg", "submat", "atk", "df")
+
+
+def slot_fields(bank, cid):
+    """{k_X: bank.X[cid]} for the per-slot card attributes of State."""
+    return {f"k_{f}": getattr(bank, f)[cid] for f in SLOT_FIELDS}
+
+
+def with_cid(bank, s, cid):
+    """s with other cards in its slots: cid and the per-slot attributes together."""
+    return s._replace(cid=cid, **slot_fields(bank, cid))
 
 
 def _merge(i, outs):
@@ -750,7 +784,7 @@ def group_to_owner_zone(bank, s, mask, zone, reason=0):
     """Hand or top of the owner's Deck; Extra Deck monsters return to the Extra Deck face-down.
     ST_LEAVE stays in place; SendtoDeck does not move a card already in its Deck or a monster already in the Extra."""
     mask = mask & ((s.st & ST_LEAVE) == 0)
-    ex = mask & ((bank.ctype[s.cid] & TYPE_EXTRA) != 0)
+    ex = mask & ((s.k_ctype & TYPE_EXTRA) != 0)
     mask &= (zone != Z_DECK) | ~((s.zone == Z_DECK) | (ex & (s.zone == Z_EXTRA)))
     return group_send(s, mask, zone, P_HAND, Z_EXTRA, P_FD_DEF, alt=ex, reason=reason)
 
@@ -758,7 +792,7 @@ def group_to_owner_zone(bank, s, mask, zone, reason=0):
 def group_to_grave(bank, s, mask, reason=0):
     """Send to the GY. A Pendulum that leaves the field (monster zone, or Spell/Trap zone without a negated
     activation) goes to the Extra Deck instead, face-up, after the other cards (field::send_to, no EVENT_TO_GRAVE)."""
-    pen = (bank.ctype[s.cid] & TYPE_PENDULUM) != 0
+    pen = (s.k_ctype & TYPE_PENDULUM) != 0
     red = mask & pen & ((s.zone == Z_MZONE) | ((s.zone == Z_SZONE) & ((s.st & ST_ACTDIS) == 0)))
     return raise_ev(group_send(s, mask, Z_GRAVE, P_GRAVE, Z_EXTRA, P_FU_DEF, alt=red, reason=reason), EV_TO_GRAVE, mask & ~red, s.tp)
 
@@ -886,7 +920,7 @@ def trig_eval(bank, s):
     window (after the chain is built: the opponent of the last chain link has priority)."""
     n = s.cid.shape[0]
     ebits = (1 << jnp.arange(E))[:, None]
-    stage = (s.ctrl != s.tp)[None, :] + 2 * (bank.ekind[s.cid].T == K_TRIG_O)
+    stage = (s.ctrl != s.tp)[None, :] + 2 * (s.k_ekind.T == K_TRIG_O)
     hidden = ((s.tg_e[None, :] & (ebits << E)) != 0)
     pending = (((s.tg_e[None, :] & ebits) != 0) | hidden) & s.tg[None, :] & (s.dec == D_TRIG) & ~s.done
     stage = jnp.where(hidden, 4, stage)  # private hand: QuickEffect after the public SEGOC
@@ -951,16 +985,16 @@ def trig_point(bank, s):
     zr = in_range(s)
     tg_e = jnp.zeros_like(s.tg_e)
     for e in range(E):
-        k = bank.ekind[s.cid, e]
-        et = bank.etrig[s.cid, e]
+        k = s.k_ekind[:, e]
+        et = s.k_etrig[:, e]
         when = (k == K_TRIG_O) & ((et & TRIG_WHEN) != 0)
         fld = (et & TRIG_FIELD) != 0
         evs = jnp.where(fld, jnp.where(when, awbits, abits), jnp.where(when, wbits, bits))
         # effect::is_activateable: during the damage step, an optional FIELD trigger without
         # EFFECT_FLAG_DAMAGE_STEP only responds to battle events (codes 1132-1149)
-        ds_lock = (k == K_TRIG_O) & fld & (s.dstep != DS_NONE) & ((bank.edmg[s.cid, e] & DMG_STEP) == 0)
+        ds_lock = (k == K_TRIG_O) & fld & (s.dstep != DS_NONE) & ((s.k_edmg[:, e] & DMG_STEP) == 0)
         evs = jnp.where(ds_lock, evs & ((1 << EV_BATTLE_DESTROYED) | (1 << EV_PRE_DMG)), evs)
-        hit = ((k == K_TRIG_F) | (k == K_TRIG_O)) & ((et & evs) != 0) & (~fld | ((zr & bank.erng[s.cid, e]) != 0))
+        hit = ((k == K_TRIG_F) | (k == K_TRIG_O)) & ((et & evs) != 0) & (~fld | ((zr & s.k_erng[:, e]) != 0))
         private = (k == K_TRIG_O) & (s.zone == Z_HAND) & ((s.pos & P_FACEUP) == 0)
         tg_e |= jnp.where(hit, jnp.where(private, 1 << (e + E), 1 << e), 0).astype(I32)
     tg = tg_e != 0
@@ -1216,16 +1250,24 @@ def battle(bank, s, a, t):
 
 def speed(bank, cid, e):
     """Spell speed: 1 (Normal Spell, ignition), 2 (Quick-Play, Trap, monster quick effect), 3 (Counter Trap)."""
-    ct = bank.ctype[cid]
-    act = bank.ekind[cid, e] == K_ACTIVATE
+    return speed_of(bank.ctype[cid], bank.ekind[cid, e])
+
+
+def speed_of(ct, kind):
+    """speed() from the card type and the effect kind."""
+    act = kind == K_ACTIVATE
     fast = ((ct & TYPE_TRAP) != 0) | ((ct & TYPE_QUICKPLAY) != 0)
-    quick = bank.ekind[cid, e] == K_QUICK
+    quick = kind == K_QUICK
     return jnp.where(act & fast, jnp.where((ct & TYPE_COUNTER) != 0, 3, 2), jnp.where(quick, 2, 1)).astype(I32)
 
 
 def set_match(bank, cid, sc):
     """Card cid belongs to archetype sc (ygopro's rule: same archetype, sc is a subset of the card's sub-archetype)."""
-    cs = bank.setcode[cid]
+    return set_match_cs(bank.setcode[cid], sc)
+
+
+def set_match_cs(cs, sc):
+    """set_match on setcode rows cs [..., NSET]."""
     return ((cs != 0) & ((cs & 0xFFF) == (sc & 0xFFF)) & ((cs & sc) == sc)).any(-1)
 
 
@@ -1251,10 +1293,10 @@ def ss_locked(bank, s):
 
 def special_allowed(bank, s, proper=False):
     """Current Summonability per effect; a real procedure bypasses only the revive limit."""
-    revive = (bank.erl[s.cid] == 0) | ((bank.erl[s.cid] == 1) &
+    revive = (s.k_erl == 0) | ((s.k_erl == 1) &
              (s.proc | ((s.zone == Z_EXTRA) & ((s.pos & P_FACEUP) == 0))))
     return ((s.zone != Z_MZONE) & ((s.fl_c & FL_NO_SS) == 0)
-            & ((bank.ctype[s.cid] & TYPE_MONSTER) != 0) & (revive | proper))
+            & ((s.k_ctype & TYPE_MONSTER) != 0) & (revive | proper))
 
 
 def reason_matches(actual, selector):
@@ -1277,28 +1319,28 @@ def filter_mask(bank, s, f, p, h, bdes=True, targ=False):
     if bdes:
         m &= (s.st & ST_BDES) == 0  # destroyed by battle: no longer targetable (ygopro is_capable_be_effect_target)
     m &= (f[F_POS] == 0) | ((s.pos & f[F_POS]) != 0)
-    ct = bank.ctype[s.cid]
+    ct = s.k_ctype
     ct = jnp.where(((ct & TYPE_PENDULUM) != 0) & (s.zone == Z_SZONE), P_SPELL, ct)  # Pendulum Zone: Pendulum Spell
     m &= (f[F_TYPE] == 0) | ((ct & f[F_TYPE]) != 0)
     m &= (ct & f[F_NOTTYPE]) == 0
     m &= ~((f[F_NOT_SELF] != 0) & (jnp.arange(n) == h))
     atk, df = s.atk_c, s.df_c
-    m &= (f[F_ATTR] == 0) | ((bank.attr[s.cid] & f[F_ATTR]) != 0)
-    m &= (f[F_RACE] == 0) | ((bank.race[s.cid] & f[F_RACE]) != 0)
-    m &= (f[F_SET] == 0) | set_match(bank, s.cid, f[F_SET])
-    code = bank.code[s.cid]
+    m &= (f[F_ATTR] == 0) | ((s.k_attr & f[F_ATTR]) != 0)
+    m &= (f[F_RACE] == 0) | ((s.k_race & f[F_RACE]) != 0)
+    m &= (f[F_SET] == 0) | set_match_cs(s.k_setcode, f[F_SET])
+    code = s.k_code
     # F_CODE1 < 0: everything except the name -F_CODE1 (not c:IsCode(id))
     m &= jnp.where(f[F_CODE1] < 0, code != -f[F_CODE1], (f[F_CODE1] == 0) | (code == f[F_CODE1]) | (code == f[F_CODE2]))
     by_p = s.ss_t & (((s.suminfo >> 31) & 1) == p)
     vst = (s.st | jnp.where(by_p, ST_SST, 0) | jnp.where(by_p & (((s.suminfo >> 16) & Z_EXTRA) != 0), ST_SSXT, 0)
            | jnp.where((s.st & ST_LEAVE) == 0, ST_STAY, 0))
     m &= (f[F_ST] == 0) | jnp.where(f[F_ST] < 0, summon_matches(s.suminfo, f[F_ST]), (vst & f[F_ST]) != 0)
-    lv = bank.level[s.cid]
-    nolv = (bank.ctype[s.cid] & (TYPE_XYZ | TYPE_LINK)) != 0  # without Level: only an unbounded filter
+    lv = s.k_level
+    nolv = (s.k_ctype & (TYPE_XYZ | TYPE_LINK)) != 0  # without Level: only an unbounded filter
     m &= jnp.where(nolv, (f[F_LV_LO] <= -BIG) & (f[F_LV_HI] >= BIG), (lv >= f[F_LV_LO]) & (lv <= f[F_LV_HI]))
     # IsCanBeSpecialSummoned: current conditions, and Link only in attack.
     m &= (f[F_SPSUM] == 0) | (special_allowed(bank, s)
-                              & ~((f[F_SPSUM] == 2) & ((bank.ctype[s.cid] & TYPE_LINK) != 0)))
+                              & ~((f[F_SPSUM] == 2) & ((s.k_ctype & TYPE_LINK) != 0)))
     # Fusion / Ritual: SummonEffFilter and Ritual.Filter also require IsCanBeSpecialSummoned (fl_c is up to date here,
     # not necessarily when fz_c / rz_c are computed)
     nss = (s.fl_c & FL_NO_SS) == 0
@@ -1324,7 +1366,7 @@ def filter_mask(bank, s, f, p, h, bdes=True, targ=False):
     if targ:
         m &= ~untargetable(bank, s, h)
     # a Link monster has no DEF (IsDefense* false): only an unbounded filter
-    nodf = (bank.ctype[s.cid] & TYPE_LINK) != 0
+    nodf = (s.k_ctype & TYPE_LINK) != 0
     dok = jnp.where(nodf, (f[F_DEF_LO] <= -BIG) & (f[F_DEF_HI] >= BIG), (df >= f[F_DEF_LO]) & (df <= f[F_DEF_HI]))
     return m & (atk >= f[F_ATK_LO]) & (atk <= f[F_ATK_HI]) & dok
 
@@ -1351,14 +1393,14 @@ def stats(bank, s):
     faceup = (s.pos & P_FACEUP) != 0
     # continuous effects in place (effect::is_available before the condition): card face-up in its locations, resolved
     # Spell/Trap; a FIELD effect of a monster destroyed by battle no longer applies
-    k = bank.ekind[s.cid]                                          # [N, E]
-    md = bank.emod[s.cid]                                          # [N, E, MW]
+    k = s.k_ekind                                          # [N, E]
+    md = s.k_emod                                          # [N, E, MW]
     # a card placed by the Pendulum Summon in progress still has STATUS_SUMMONING: effects not yet enabled
     # (STATUS_EFFECT_ENABLED at step 27) and base ATK / DEF (card::get_attack)
     pst = (s.st & ST_PSTEP) != 0
     srcok = faceup & ~pst & ((s.zone == Z_MZONE) | ((s.zone == Z_SZONE) & ((s.st & ST_ON) != 0)))
     bdok = (md[..., M_SELF] != 0) | ((s.st & ST_BDES) == 0)[:, None]
-    act = (k == K_CONT) & ((bank.erng[s.cid] & s.zone[:, None]) != 0) & srcok[:, None] & bdok
+    act = (k == K_CONT) & ((s.k_erng & s.zone[:, None]) != 0) & srcok[:, None] & bdok
     if bank.submat.shape[1]:
         act &= md[..., M_CODE] != MC_FUS_SUB  # passive property, no slot of stats()/KM
     flat = jnp.nonzero(act.reshape(-1), size=KM, fill_value=0)[0]  # card then effect order
@@ -1464,9 +1506,9 @@ def stats(bank, s):
         cur = jnp.maximum(jnp.where(x < 0, b, x) + up + upc, 0)
         onx = onf & ~pst
         return jnp.where(onx, jnp.maximum(jnp.where(ll >= 0, at(ll), cur), 0), base), jnp.where(onx, b, base)
-    atk, batk = fold(bank.atk[s.cid], MC_ATK, MC_SET_ATK, MC_FINAL_ATK, MC_BASE_ATK)
-    df, _ = fold(bank.df[s.cid], MC_DEF, MC_SET_DEF, MC_FINAL_DEF, MC_BASE_DEF)
-    df = jnp.where((bank.ctype[s.cid] & TYPE_LINK) != 0, 0, df)  # card::get_defense: always 0 for a Link
+    atk, batk = fold(s.k_atk, MC_ATK, MC_SET_ATK, MC_FINAL_ATK, MC_BASE_ATK)
+    df, _ = fold(s.k_df, MC_DEF, MC_SET_DEF, MC_FINAL_DEF, MC_BASE_DEF)
+    df = jnp.where((s.k_ctype & TYPE_LINK) != 0, 0, df)  # card::get_defense: always 0 for a Link
     return (atk.astype(I32), df.astype(I32), batk.astype(I32), fl, ib.astype(I32), pf.astype(I32), cav, cav_t, clk,
             tm_m, act.sum() > KM)
 
@@ -1591,12 +1633,12 @@ MAT_FIELDS = (F_TYPE, F_NOTTYPE, F_ATTR, F_RACE, F_SET, F_CODE1, F_CODE2, F_LV_L
 
 def mat_mask(bank, s, f):
     """Lightweight material filter (only the MAT_FIELDS fields, without the location): cheaper than filter_mask."""
-    ct, code, lv = bank.ctype[s.cid], bank.code[s.cid], bank.level[s.cid]
+    ct, code, lv = s.k_ctype, s.k_code, s.k_level
     m = (f[F_TYPE] == 0) | ((ct & f[F_TYPE]) != 0)
     m &= (ct & f[F_NOTTYPE]) == 0
-    m &= (f[F_ATTR] == 0) | ((bank.attr[s.cid] & f[F_ATTR]) != 0)
-    m &= (f[F_RACE] == 0) | ((bank.race[s.cid] & f[F_RACE]) != 0)
-    m &= (f[F_SET] == 0) | set_match(bank, s.cid, f[F_SET])
+    m &= (f[F_ATTR] == 0) | ((s.k_attr & f[F_ATTR]) != 0)
+    m &= (f[F_RACE] == 0) | ((s.k_race & f[F_RACE]) != 0)
+    m &= (f[F_SET] == 0) | set_match_cs(s.k_setcode, f[F_SET])
     # F_CODE1 < 0: everything except the name -F_CODE1 (not c:IsCode(id))
     m &= jnp.where(f[F_CODE1] < 0, code != -f[F_CODE1], (f[F_CODE1] == 0) | (code == f[F_CODE1]) | (code == f[F_CODE2]))
     nolv = (ct & (TYPE_XYZ | TYPE_LINK)) != 0
@@ -1607,7 +1649,7 @@ def fus_cands(bank, s, c):
     """[FK, N]: cards usable for each material of Fusion monster c (hand and field of its owner, monsters, not
     destroyed by battle)."""
     p = s.owner[c]
-    mats = (((s.zone == Z_HAND) | (s.zone == Z_MZONE)) & (s.ctrl == p) & ((bank.ctype[s.cid] & TYPE_MONSTER) != 0)
+    mats = (((s.zone == Z_HAND) | (s.zone == Z_MZONE)) & (s.ctrl == p) & ((s.k_ctype & TYPE_MONSTER) != 0)
             & ((s.st & ST_BDES) == 0))
     k = bank.fmn[s.cid[c]]
     return jnp.stack([mat_mask(bank, s, bank.fmat[s.cid[c], j]) & mats & (j < k) for j in range(FK)])
@@ -1621,7 +1663,7 @@ def fusion_ok(bank, s):
     if bank.submat.shape[1]:
         return fusion_sub_ok(bank, s)
     n = s.cid.shape[0]
-    want = (s.zone == Z_EXTRA) & (bank.fmn[s.cid] > 0)
+    want = (s.zone == Z_EXTRA) & (s.k_fmn > 0)
     idx = jnp.nonzero(want, size=EXK, fill_value=0)[0]
     live = jnp.arange(EXK) < want.sum()
     nq = 1 << FK
@@ -1697,14 +1739,14 @@ def fus_picks(bank, s, f):
 
 def fusion_sub_cards(bank, s, f):
     """SINGLE but not SINGLE_RANGE: also available face-down, except effective negation."""
-    return ((bank.submat[s.cid, 0] & s.zone) != 0) & ((bank.ctype[s.cid] & TYPE_MONSTER) != 0) & (s.ctrl == s.owner[f]) & \
+    return ((s.k_submat[:, 0] & s.zone) != 0) & ((s.k_ctype & TYPE_MONSTER) != 0) & (s.ctrl == s.owner[f]) & \
            ((s.zone == Z_HAND) | (s.zone == Z_MZONE)) & ((s.fl_c & FL_DISABLED) == 0) & ((s.st & ST_BDES) == 0)
 
 
 def fusion_sub_ok(bank, s):
     from fusion import completions
     n = s.cid.shape[0]
-    want = (s.zone == Z_EXTRA) & (bank.fmn[s.cid] > 0)
+    want = (s.zone == Z_EXTRA) & (s.k_fmn > 0)
     idx = jnp.nonzero(want, size=EXK, fill_value=0)[0]
     live = jnp.arange(EXK) < want.sum()
     def one(f):
@@ -1762,7 +1804,7 @@ def pend_extra_zones(bank, s, p):
 
 def has_fusion(bank, s):
     """Fusion monsters are waiting in an Extra Deck (otherwise fusion_ok is useless)."""
-    return ((s.zone == Z_EXTRA) & (bank.fmn[s.cid] > 0)).any()
+    return ((s.zone == Z_EXTRA) & (s.k_fmn > 0)).any()
 
 
 def refresh_fus(bank, s):
@@ -1776,13 +1818,13 @@ def refresh_rit(bank, s):
 
 def rit_mats(bank, s, p):
     """[N]: Ritual materials of p (monsters of its hand and field, not destroyed by battle)."""
-    return (((s.zone == Z_HAND) | (s.zone == Z_MZONE)) & (s.ctrl == p) & ((bank.ctype[s.cid] & TYPE_MONSTER) != 0)
-            & ((s.st & ST_BDES) == 0) & (bank.level[s.cid] > 0) & ((bank.ctype[s.cid] & (TYPE_XYZ | TYPE_LINK)) == 0))
+    return (((s.zone == Z_HAND) | (s.zone == Z_MZONE)) & (s.ctrl == p) & ((s.k_ctype & TYPE_MONSTER) != 0)
+            & ((s.st & ST_BDES) == 0) & (s.k_level > 0) & ((s.k_ctype & (TYPE_XYZ | TYPE_LINK)) == 0))
 
 
 def lv_hist(bank, s, mask):
     """Histograms [LVMAX + 1] of the Levels of the cards in mask: hand, field."""
-    lv = jnp.clip(bank.level[s.cid], 0, LVMAX)
+    lv = jnp.clip(s.k_level, 0, LVMAX)
     field = s.zone == Z_MZONE
     oh = lv[None, :] == jnp.arange(LVMAX + 1)[:, None]  # one-hot (a scatter is slow under vmap)
     hh = (oh & (mask & ~field)[None, :]).sum(1, dtype=I32)
@@ -1830,7 +1872,7 @@ def ritual_ok(bank, s):
     itself; required Level: its Level). Bit 0: Greater; bit 1: Equal."""
     n = s.cid.shape[0]
     out = jnp.zeros(n, I32)
-    lvc = jnp.clip(bank.level[s.cid], 0, LVMAX)
+    lvc = jnp.clip(s.k_level, 0, LVMAX)
     for p in (0, 1):
         mats = rit_mats(bank, s, p)
         hh, hf = lv_hist(bank, s, mats)
@@ -1841,7 +1883,7 @@ def ritual_ok(bank, s):
             g, e = sum_ok(h2, hf, lv, 0, LVMAX + 1, jnp.where(room, 0, -1))
             return g.astype(I32) | (e.astype(I32) << 1)
         res = jax.vmap(cls)(jnp.arange(LVMAX + 1))
-        mine = (s.zone == Z_HAND) & (s.ctrl == p) & ((bank.ctype[s.cid] & RIT_MON) == RIT_MON)
+        mine = (s.zone == Z_HAND) & (s.ctrl == p) & ((s.k_ctype & RIT_MON) == RIT_MON)
         out = jnp.where(mine, res[lvc], out)
     return out
 
@@ -1852,7 +1894,7 @@ def rit_picks(bank, s, r, mode):
     p = s.ctrl[r]
     sel = (s.st & ST_SEL) != 0
     mats = rit_mats(bank, s, p) & (jnp.arange(s.cid.shape[0]) != r)
-    lv = jnp.clip(bank.level[s.cid], 0, LVMAX)
+    lv = jnp.clip(s.k_level, 0, LVMAX)
     field = s.zone == Z_MZONE
     hh, hf = lv_hist(bank, s, mats & ~sel)
     u0 = jnp.where(sel, lv, 0).sum()
@@ -1875,17 +1917,17 @@ def rit_picks(bank, s, r, mode):
 def rit_done(bank, s, r, mode):
     """The Ritual selection is complete (sum reached)."""
     sel = (s.st & ST_SEL) != 0
-    return jnp.where(sel, jnp.clip(bank.level[s.cid], 0, LVMAX), 0).sum() >= bank.level[s.cid[r]]
+    return jnp.where(sel, jnp.clip(s.k_level, 0, LVMAX), 0).sum() >= bank.level[s.cid[r]]
 
 
 def has_ritual(bank, s):
-    return ((s.zone == Z_HAND) & ((bank.ctype[s.cid] & RIT_MON) == RIT_MON)).any()
+    return ((s.zone == Z_HAND) & ((s.k_ctype & RIT_MON) == RIT_MON)).any()
 
 
 def syn_mats(bank, s, c):
     """[N], [N]: Tuners and non-Tuners usable for Synchro monster c (face-up monsters on its owner's field,
     of Level >= 1, neither Xyz nor Link; filters of the bank)."""
-    ct, lv = bank.ctype[s.cid], bank.level[s.cid]
+    ct, lv = s.k_ctype, s.k_level
     base = ((s.zone == Z_MZONE) & (s.ctrl == s.owner[c]) & ((s.pos & P_FACEUP) != 0) & ((ct & TYPE_MONSTER) != 0)
             & ((ct & (TYPE_XYZ | TYPE_LINK)) == 0) & (lv >= 1) & ((s.st & ST_BDES) == 0))
     tun = (ct & TYPE_TUNER) != 0
@@ -1916,11 +1958,11 @@ def synchro_ok(bank, s):
     non-Tuners (at least one) whose Levels sum to exactly L - t. Since the materials are on the field, a zone
     is always freed. O(EXK x (N + LVMAX log SMAX))."""
     n = s.cid.shape[0]
-    want = (s.zone == Z_EXTRA) & (bank.syn[s.cid] != 0) & (s.owner == s.dec_player)
+    want = (s.zone == Z_EXTRA) & (s.k_syn != 0) & (s.owner == s.dec_player)
     idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     lvs = jnp.arange(LVMAX + 1)
-    lv = jnp.clip(bank.level[s.cid], 0, LVMAX)
+    lv = jnp.clip(s.k_level, 0, LVMAX)
 
     def one(c, ok):
         t, nt = syn_mats(bank, s, c)
@@ -1938,7 +1980,7 @@ def syn_picks(bank, s, c):
     complete the sum), then the non-Tuners (the rest of the sum stays reachable)."""
     t, nt = syn_mats(bank, s, c)
     sel = (s.st & ST_SEL) != 0
-    lv = jnp.clip(bank.level[s.cid], 0, LVMAX)
+    lv = jnp.clip(s.k_level, 0, LVMAX)
     lvs = jnp.arange(LVMAX + 1)
     oh = lv[None, :] == lvs[:, None]
     h = (oh & (nt & ~sel)[None, :]).sum(1, dtype=I32)
@@ -1953,11 +1995,11 @@ def syn_picks(bank, s, c):
 
 def syn_done(bank, s):
     sel = (s.st & ST_SEL) != 0
-    return jnp.where(sel, jnp.clip(bank.level[s.cid], 0, LVMAX), 0).sum() >= bank.level[s.cid[s.pend]]
+    return jnp.where(sel, jnp.clip(s.k_level, 0, LVMAX), 0).sum() >= bank.level[s.cid[s.pend]]
 
 
 def has_synchro(bank, s):
-    return ((s.zone == Z_EXTRA) & (bank.syn[s.cid] != 0)).any()
+    return ((s.zone == Z_EXTRA) & (s.k_syn != 0)).any()
 
 
 def refresh_syn(bank, s):
@@ -1967,7 +2009,7 @@ def refresh_syn(bank, s):
 def xyz_mats(bank, s, c):
     """[N]: possible materials of Xyz c: face-up monsters on its owner's field, with Level equal to its
     Rank (neither Xyz nor Link: no Level), filter of the bank."""
-    ct, lv = bank.ctype[s.cid], bank.level[s.cid]
+    ct, lv = s.k_ctype, s.k_level
     return ((s.zone == Z_MZONE) & (s.ctrl == s.owner[c]) & ((s.pos & P_FACEUP) != 0) & ((ct & TYPE_MONSTER) != 0)
             & ((ct & (TYPE_XYZ | TYPE_LINK)) == 0) & (lv == bank.level[s.cid[c]]) & ((s.st & ST_BDES) == 0)
             & mat_mask(bank, s, bank.xmat[s.cid[c]]))
@@ -1976,7 +2018,7 @@ def xyz_mats(bank, s, c):
 def xyz_ok(bank, s):
     """[N] xz_c: Xyz monsters of the Extra Deck that can be Summoned (at least xct possible materials). O(EXK x N)."""
     n = s.cid.shape[0]
-    want = (s.zone == Z_EXTRA) & (bank.xct[s.cid] > 0) & (s.owner == s.dec_player)
+    want = (s.zone == Z_EXTRA) & (s.k_xct > 0) & (s.owner == s.dec_player)
     idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     oks = jax.vmap(lambda c, ok: ok & (xyz_mats(bank, s, c).sum() >= bank.xct[s.cid[c]]))(idx, live)
@@ -1984,7 +2026,7 @@ def xyz_ok(bank, s):
 
 
 def has_xyz(bank, s):
-    return ((s.zone == Z_EXTRA) & (bank.xct[s.cid] > 0)).any()
+    return ((s.zone == Z_EXTRA) & (s.k_xct > 0)).any()
 
 
 def refresh_xyz(bank, s):
@@ -2001,8 +2043,8 @@ def link_arrows(bank, s, p):
     field::get_linked_zone): its own (left / right from a main zone, down from an extra zone) and those
     of the opponent in an extra zone (top arrows). Arrows toward the extra zones do not count: they are
     always within the allowed zones."""
-    mk = bank.lmark[s.cid]
-    on = (s.zone == Z_MZONE) & ((bank.ctype[s.cid] & TYPE_LINK) != 0) & ((s.pos & P_FACEUP) != 0) & ((s.st & ST_PSTEP) == 0)
+    mk = s.k_lmark
+    on = (s.zone == Z_MZONE) & ((s.k_ctype & TYPE_LINK) != 0) & ((s.pos & P_FACEUP) != 0) & ((s.st & ST_PSTEP) == 0)
     q = s.seq[:, None]
     j = jnp.arange(5)[None, :]
     has = lambda b: ((mk & b) != 0)[:, None]
@@ -2031,16 +2073,16 @@ def pend_info(bank, s, p):
     Special Summoned; those of the hand only with a free main zone (ft1 > 0), those of the Extra Deck only with an
     allowed zone (ft2 > 0: free main zones designated by an arrow, plus an extra zone). ft: usable zones
     (GetUsableMZoneCount). ft1 and ft2 are bounded by the number of candidates (Pendulum.Operation)."""
-    ct = bank.ctype[s.cid]
+    ct = s.k_ctype
     pen = (ct & TYPE_PENDULUM) != 0
     sz = (s.zone == Z_SZONE) & (s.ctrl == p) & pen
     lm, rm = sz & (s.seq == 0), sz & (s.seq == 4)
     l, r = jnp.argmax(lm), jnp.argmax(rm)
     a, b = bank.lsc[s.cid[l]], bank.rsc[s.cid[r]]
     lo, hi = jnp.minimum(a, b), jnp.maximum(a, b)
-    lv = bank.level[s.cid]
+    lv = s.k_level
     ok = ((lv > lo) & (lv < hi) & ((ct & TYPE_MONSTER) != 0) & ((ct & (TYPE_XYZ | TYPE_LINK)) == 0)
-          & ((s.fl_c & FL_NO_SS) == 0) & ((bank.erl[s.cid] == 0) | ((bank.erl[s.cid] == 1) & s.proc)) & (s.ctrl == p))
+          & ((s.fl_c & FL_NO_SS) == 0) & ((s.k_erl == 0) | ((s.k_erl == 1) & s.proc)) & (s.ctrl == p))
     ez = ex_zones(s, p)
     free = ez[:N_MAIN_ZONES]
     lz = free & link_arrows(bank, s, p).any(0)
@@ -2091,10 +2133,10 @@ def _swap12(m):
 def link_cells(bank, s, p):
     """Face-up Link monsters on the field over the 12 zones seen from p (see arrows_at): zone of each card [N]
     (12: none), zones designated by each zone [12], zones held by a Link [12], co-linked neighbors of each zone [12] (masks)."""
-    on = (s.zone == Z_MZONE) & ((bank.ctype[s.cid] & TYPE_LINK) != 0) & ((s.pos & P_FACEUP) != 0) & ((s.st & ST_PSTEP) == 0)
+    on = (s.zone == Z_MZONE) & ((s.k_ctype & TYPE_LINK) != 0) & ((s.pos & P_FACEUP) != 0) & ((s.st & ST_PSTEP) == 0)
     mine = s.ctrl == p
     q = s.seq
-    m = arrows_at(bank.lmark[s.cid], q)
+    m = arrows_at(s.k_lmark, q)
     m = jnp.where(mine, m, _swap12(m))
     cell = jnp.where(mine, q, jnp.where(q < 5, q + 7, 11 - q))
     cell = jnp.where(on, cell, 12)
@@ -2149,13 +2191,13 @@ def link_table(bank, s, p):
     L > 1 counts 1 or L, Link.GetLinkCount); contains a Link [128]; subset of face-up monsters, and a zone
     remains for the Link monster once these materials are gone (GetLocationCountFromEx with the materials: neither
     their zones nor their arrows) [128]; Extra Link per subset (extra_link). O(7 N + 128 x 7 x 5 + 128 x 12 x 11)."""
-    ct = bank.ctype[s.cid]
+    ct = s.k_ctype
     mine = (s.zone == Z_MZONE) & (s.ctrl == p)
     oh = mine[None, :] & (s.seq[None, :] == jnp.arange(7)[:, None])      # [7, N]
     used = oh.any(1)
     ok = (oh & (((s.pos & P_FACEUP) != 0) & ((ct & TYPE_MONSTER) != 0))[None, :]).any(1)
     islk = (oh & ((ct & TYPE_LINK) != 0)[None, :]).any(1)
-    r = jnp.where(oh, bank.level[s.cid][None, :], 0).sum(1)
+    r = jnp.where(oh, s.k_level[None, :], 0).sum(1)
     arw = link_arrows(bank, s, p)
     own = (oh[:, :, None] & arw[None, :, :]).any(1)                       # [7, 5] arrows of the monster of each zone
     opp = (~mine[:, None] & arw).any(0)                                  # [5]
@@ -2173,7 +2215,7 @@ def link_table(bank, s, p):
     base = ~(sub & ~ok[None, :]).any(1)
     ee, ex = extra_link(bank, s, p, sub)
     # two materials with the same name (different names required: ldiff)
-    cc = jnp.where(oh, bank.code[s.cid][None, :], 0).sum(1)              # [7]
+    cc = jnp.where(oh, s.k_code[None, :], 0).sum(1)              # [7]
     pi, pj = jnp.asarray(PAIRS7[0]), jnp.asarray(PAIRS7[1])
     same = used[pi] & used[pj] & (cc[pi] == cc[pj])                       # [21]
     dup = (sub[:, pi] & sub[:, pj] & same[None, :]).any(1)
@@ -2196,7 +2238,7 @@ def link_valid(bank, s, c, tab):
 def link_ok(bank, s):
     """[N] lz_c: Link monsters of the deciding player's Extra Deck that can be Summoned now. O(EXP x (N + 128 x 7))."""
     n = s.cid.shape[0]
-    want = (s.zone == Z_EXTRA) & (bank.lmax[s.cid] > 0) & (s.owner == s.dec_player)
+    want = (s.zone == Z_EXTRA) & (s.k_lmax > 0) & (s.owner == s.dec_player)
     idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     tab = link_table(bank, s, s.dec_player)
@@ -2223,7 +2265,7 @@ def link_picks(bank, s, c):
 
 
 def has_link(bank, s):
-    return ((s.zone == Z_EXTRA) & (bank.lmax[s.cid] > 0)).any()
+    return ((s.zone == Z_EXTRA) & (s.k_lmax > 0)).any()
 
 
 def refresh_link(bank, s):
@@ -2582,11 +2624,11 @@ def exec_one(bank, s):
         s = s._replace(suminfo=jnp.where(attempted, summon_info(typ, s.zone, p), s.suminfo), ss_t=s.ss_t | attempted)
         def prepare(_, carry):
             group, failed_space, selected, ready = carry
-            lk = (bank.ctype[s.cid] & TYPE_LINK) != 0
+            lk = (s.k_ctype & TYPE_LINK) != 0
             group &= special_allowed(bank, s, proper=c > 0) & ~(lk & ((b & P_FU_ATK) == 0))
             # A response may have filled the zones or forbidden the Summon after targeting.
             space = jnp.where(s.zone == Z_EXTRA, ex_zones(s, p).any(), free_main(s, p) > 0)
-            faceup_pend = ((s.zone == Z_EXTRA) & ((bank.ctype[s.cid] & TYPE_PENDULUM) != 0)
+            faceup_pend = ((s.zone == Z_EXTRA) & ((s.k_ctype & TYPE_PENDULUM) != 0)
                            & ((s.pos & P_FACEUP) != 0))
             pend_space = lax.fori_loop(0, (group & faceup_pend).any().astype(I32),
                 lambda _, previous: pend_extra_zones(bank, s, p).any(), jnp.bool_(True))
@@ -2722,7 +2764,7 @@ def act_cand(bank, s):
     """[E, N]: effects that the deciding player could activate, before the cost and target test (act_ok)."""
     p = s.dec_player
     mine = s.ctrl == p
-    ct = bank.ctype[s.cid]
+    ct = s.k_ctype
     spell, trap = (ct & TYPE_SPELL) != 0, (ct & TYPE_TRAP) != 0
     quick = spell & ((ct & TYPE_QUICKPLAY) != 0)
     in_hand = mine & (s.zone == Z_HAND)
@@ -2746,10 +2788,10 @@ def act_cand(bank, s):
     tkind = jnp.where(s.tst < 2, K_TRIG_F, K_TRIG_O)
     cand = []
     for e in range(E):
-        kind = bank.ekind[s.cid, e]
-        trig = bank.etrig[s.cid, e]
+        kind = s.k_ekind[:, e]
+        trig = s.k_etrig[:, e]
         act = kind == K_ACTIVATE
-        rng = bank.erng[s.cid, e]
+        rng = s.k_erng[:, e]
         # locations of a monster quick effect / ignition effect (erng; 0 for an ignition effect: monster zone)
         rng = jnp.where((kind == K_IGNITION) & (rng == 0), Z_MZONE, rng)
         inr = ((in_hand & ((rng & Z_HAND) != 0)) | (faceup_mon & ((rng & Z_MZONE) != 0))
@@ -2761,11 +2803,11 @@ def act_cand(bank, s):
                  | ((idle | fast) & quick & act & ((from_hand & (p == s.tp)) | ready))
                  | ((idle | fast) & trap & act & ready & ((s.pf_c[p] & PF_NO_TRAP) == 0))
                  | (idle & inr & (kind == K_IGNITION)))
-        where &= speed(bank, s.cid, e) >= top_spd
+        where &= speed_of(s.k_ctype, s.k_ekind[:, e]) >= top_spd
         where &= (trig == 0) | ((trig & evb) != 0)
         # damage step (effect::is_activateable): DAMAGE_STEP / DAMAGE_CAL flags, except Counter Traps and effects
         # on a battle event; after the calculation, the StatChangeDamageStepCondition condition forbids
-        dmg = bank.edmg[s.cid, e]
+        dmg = s.k_edmg[:, e]
         dsok = jnp.where(s.dstep == DS_BEFORE, (dmg & DMG_STEP) != 0,
                          jnp.where(s.dstep == DS_CAL, (dmg & DMG_CAL) != 0,
                                    ((dmg & DMG_STEP) != 0) & ((dmg & DMG_STAT) == 0)))
@@ -2803,14 +2845,14 @@ def legal(bank, s, fus=True):
     n = s.cid.shape[0]
     p = s.dec_player
     mine = s.ctrl == p
-    ct = bank.ctype[s.cid]
+    ct = s.k_ctype
     monster, spell, trap = (ct & TYPE_MONSTER) != 0, (ct & TYPE_SPELL) != 0, (ct & TYPE_TRAP) != 0
     in_hand = mine & (s.zone == Z_HAND)
     my_mon = mine & (s.zone == Z_MZONE)
     op_mon = (s.ctrl == 1 - p) & (s.zone == Z_MZONE)
     free_m, free_s = free_main(s, p), free_main(s, p, Z_SZONE)
     nmon = my_mon.sum()
-    lv = bank.level[s.cid]
+    lv = s.k_level
     need = jnp.where(lv >= 7, 2, jnp.where(lv >= 5, 1, 0))
     # Ritual monsters and Extra Deck monsters: no Normal Summon
     can_ns = (in_hand & monster & ~s.ns_used & jnp.where(need == 0, free_m > 0, nmon >= need)
@@ -3143,7 +3185,7 @@ def forced_m(bank, s, m):
     # (the oracle then has a single option): it reaches the sum with no superfluous card (Greater) or exactly (Equal)
     n = s.cid.shape[0]
     cand = m[V_SELECT * n:(V_SELECT + 1) * n] | ((s.st & ST_SEL) != 0)
-    lv = jnp.clip(bank.level[s.cid], 0, LVMAX)
+    lv = jnp.clip(s.k_level, 0, LVMAX)
     tot = jnp.where(cand, lv, 0).sum()
     mn = jnp.where(cand, lv, LVMAX + 1).min()
     rit = jnp.argmax(s.reg[jnp.clip(current_ins(bank, s)[2], 0, R - 1)])
@@ -3374,7 +3416,7 @@ def new_game(bank, deck0, deck1, key=None, extra0=None, extra1=None, extra_count
               tm_m=jnp.zeros((TM, n), bool), tm_v=jnp.zeros((TM, n), I32), tm_t=jnp.zeros(TM, I32), tm_dur=jnp.zeros(TM, I32), tm_rd=jnp.zeros(TM, bool), tm_src=jnp.full(TM, -1, I32), tm_n=_i(0),
               ovf=_i(0), en_t=z, fl_c=z, ib_c=jnp.full(n, BIG, I32), pf_c=jnp.zeros(2, I32), cav=jnp.zeros((n, E), bool), cav_t=jnp.zeros((n, E), I32),
               proc=jnp.zeros(n, bool), fz_c=jnp.zeros(n, bool), fsel=f, rz_c=z, rsel=_i(0), sz_c=jnp.zeros(n, bool),
-              xz_c=jnp.zeros(n, bool), lz_c=jnp.zeros(n, bool), cl_c=jnp.zeros(n, bool), psel=_i(0), ov_par=jnp.full(n, -1, I32), eq_t=jnp.full(n, -1, I32), eq_mv=z, ps_used=f, uid=uid)
+              xz_c=jnp.zeros(n, bool), lz_c=jnp.zeros(n, bool), cl_c=jnp.zeros(n, bool), psel=_i(0), ov_par=jnp.full(n, -1, I32), eq_t=jnp.full(n, -1, I32), eq_mv=z, ps_used=f, uid=uid, **slot_fields(bank, cid))
     for p in (0, 1):
         for _ in range(5):
             s = draw(s, p)

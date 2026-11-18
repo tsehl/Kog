@@ -43,7 +43,7 @@ class ActivationProgramTests(unittest.TestCase):
         for card in range(len(codes)):
             for count in range(11):
                 zones = jnp.where(jnp.arange(80) < count, core.Z_HAND, core.Z_GRAVE)
-                trial = state._replace(cid=state.cid.at[0].set(card), zone=zones,
+                trial = core.with_cid(bank, state, state.cid.at[0].set(card))._replace(zone=zones,
                                        ctrl=jnp.zeros(80, jnp.int32), dec_player=jnp.int32(0))
                 self.assertEqual(bool(actual(bank, trial)), bool(expected(bank, trial, jnp.int32(0))), (card, count))
         np.testing.assert_array_equal(bank.prog, original)

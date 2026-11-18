@@ -20,7 +20,7 @@ class InlineTests(unittest.TestCase):
             **cards.assemble([1, 2], cards={1: [activation, quick]}, ritual={}, fusion={}, synchro={}, xyz={}, link={}))
         d = jnp.ones(40, jnp.int32)
         cls.state = jax.jit(core.new_game)(cls.bank, d, d)
-        cls.state = cls.state._replace(cid=cls.state.cid.at[0].set(0), zone=cls.state.zone.at[0].set(core.Z_SZONE),
+        cls.state = core.with_cid(cls.bank, cls.state, cls.state.cid.at[0].set(0))._replace(zone=cls.state.zone.at[0].set(core.Z_SZONE),
             pos=cls.state.pos.at[0].set(core.P_SFU), ctrl=cls.state.ctrl.at[0].set(0),
             dec_player=jnp.int32(0), wk=jnp.int32(core.W_QUICK))
 

@@ -50,7 +50,7 @@ class DeckTopTests(unittest.TestCase):
     def test_extra_redirection_preserves_faceup_pendulum_order(self):
         s = self.state
         s = core.compact(s, jnp.arange(s.cid.size) < 3)
-        s = s._replace(cid=s.cid.at[0].set(1), zone=s.zone.at[0].set(core.Z_GRAVE)
+        s = core.with_cid(self.bank, s, s.cid.at[0].set(1))._replace(zone=s.zone.at[0].set(core.Z_GRAVE)
                        .at[1:3].set(core.Z_EXTRA),
                        pos=s.pos.at[1].set(core.P_FD_DEF).at[2].set(core.P_FU_DEF),
                        seq=s.seq.at[0].set(0).at[1].set(0).at[2].set(1))
@@ -62,7 +62,7 @@ class DeckTopTests(unittest.TestCase):
     def test_already_in_deck_extra_and_leave_confirmed_stay(self):
         s = self.state
         s = core.compact(s, (jnp.arange(s.cid.size) == 1) | (jnp.arange(s.cid.size) == 2))
-        s = s._replace(cid=s.cid.at[1].set(1), zone=s.zone.at[1].set(core.Z_EXTRA)
+        s = core.with_cid(self.bank, s, s.cid.at[1].set(1))._replace(zone=s.zone.at[1].set(core.Z_EXTRA)
                        .at[2].set(core.Z_SZONE), seq=s.seq.at[1:3].set(0),
                        st=s.st.at[2].set(core.ST_LEAVE))
         out = self.send(s, jnp.arange(s.cid.size) < 3)

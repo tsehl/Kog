@@ -46,10 +46,11 @@ class MatchingTests(unittest.TestCase):
         recipe = cards.FusionRecipe([cards.MAT(code=100),cards.MAT(code=101),cards.MAT(code=101)],True)
         bank = core.make_bank(np.array(codes),[1000]*4,[1000]*4,[4]*4,
                               ctype=[17,17,33,65],**cards.assemble(codes,cards=effects,fusion={999:recipe},synchro={},xyz={},link={},ritual={}))
-        State = namedtuple('MiniState','cid zone ctrl owner seq st fl_c')
-        state = State(jnp.array([0,1,2,2,0,1,3,0]),jnp.array([core.Z_HAND]*6+[core.Z_EXTRA,core.Z_DECK]),
+        State = namedtuple('MiniState','cid zone ctrl owner seq st fl_c '+' '.join('k_'+f for f in core.SLOT_FIELDS))
+        cid0 = jnp.array([0,1,2,2,0,1,3,0])
+        state = State(cid0,jnp.array([core.Z_HAND]*6+[core.Z_EXTRA,core.Z_DECK]),
                       jnp.zeros(8,jnp.int32),jnp.zeros(8,jnp.int32),jnp.array([0,1,2,3,4,5,0,0]),
-                      jnp.zeros(8,jnp.int32),jnp.zeros(8,jnp.int32))
+                      jnp.zeros(8,jnp.int32),jnp.zeros(8,jnp.int32),**core.slot_fields(bank,cid0))
         pick = jax.jit(lambda s: core.fus_picks(bank,s,jnp.int32(6)))
         normal = np.array([[1,0,0,0,1,0],[0,1,0,0,0,1],[0,1,0,0,0,1]],bool)
         states=[];expected_states=[]
@@ -80,13 +81,14 @@ class MatchingTests(unittest.TestCase):
         recipe=cards.FusionRecipe([cards.MAT(code=100),cards.MAT(code=101)],True)
         bank=core.make_bank(np.array(codes),[1000]*5,[1000]*5,[4]*5,ctype=[17,17,33,17,65],
                             **cards.assemble(codes,cards=effects,fusion={999:recipe},ritual={},synchro={},xyz={},link={}))
-        State=namedtuple('FullState','cid zone ctrl owner seq st fl_c')
-        s=State(jnp.array([0,1,2,0,1,2,4]+[3]*6),jnp.array([core.Z_HAND]*6+[core.Z_EXTRA]+[core.Z_MZONE]*6),
+        State=namedtuple('FullState','cid zone ctrl owner seq st fl_c '+' '.join('k_'+f for f in core.SLOT_FIELDS))
+        cid1=jnp.array([0,1,2,0,1,2,4]+[3]*6)
+        s=State(cid1,jnp.array([core.Z_HAND]*6+[core.Z_EXTRA]+[core.Z_MZONE]*6),
                 jnp.zeros(13,jnp.int32),jnp.zeros(13,jnp.int32),jnp.array([0,1,2,3,4,5,0,0,1,2,3,4,5]),
-                jnp.zeros(13,jnp.int32),jnp.zeros(13,jnp.int32))
+                jnp.zeros(13,jnp.int32),jnp.zeros(13,jnp.int32),**core.slot_fields(bank,cid1))
         available=jax.jit(lambda state:core.fusion_ok(bank,state)[0][6])
         self.assertFalse(bool(available(s)))
-        self.assertTrue(bool(available(s._replace(cid=s.cid.at[7].set(1)))))
+        self.assertTrue(bool(available(s._replace(cid=s.cid.at[7].set(1),**core.slot_fields(bank,s.cid.at[7].set(1))))))
 
 
 if __name__ == '__main__': unittest.main()

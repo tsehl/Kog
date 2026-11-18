@@ -36,8 +36,8 @@ class PrivateHandTriggerTests(unittest.TestCase):
     def event(self, *, public=False, hand_limit=False):
         s = self.state
         if public:
-            s = s._replace(cid=s.cid.at[40].set(1), zone=s.zone.at[40].set(core.Z_MZONE),
-                           pos=s.pos.at[40].set(core.P_FU_ATK))
+            s = core.with_cid(self.bank, s, s.cid.at[40].set(1))._replace(zone=s.zone.at[40].set(core.Z_MZONE),
+                                                                          pos=s.pos.at[40].set(core.P_FU_ATK))
         s = core.raise_ev(s, core.EV_TO_GRAVE, jnp.arange(80) == 1, 0)
         s = core.open_quick(s, 0, core.R_HAND if hand_limit else core.R_IDLE, chained=False)
         return self.evaluate(self.bank, core.trig_point(self.bank, s))
@@ -70,10 +70,10 @@ class PrivateHandTriggerTests(unittest.TestCase):
         s = self.event()._replace(n_chain=jnp.int32(1), lk_src=self.state.lk_src.at[0].set(40),
                                  lk_eff=self.state.lk_eff.at[0].set(0))
         for cid, expected in ((2, True), (3, False)):
-            self.assertEqual(bool(self.candidates(self.bank, s._replace(cid=s.cid.at[40].set(cid)))[0, 0]), expected)
+            self.assertEqual(bool(self.candidates(self.bank, core.with_cid(self.bank, s, s.cid.at[40].set(cid)))[0, 0]), expected)
 
     def test_false_initial_condition_and_departed_handler_are_excluded(self):
-        s = self.state._replace(cid=self.state.cid.at[0].set(4))
+        s = core.with_cid(self.bank, self.state, self.state.cid.at[0].set(4))
         s = core.raise_ev(s, core.EV_TO_GRAVE, jnp.arange(80) == 1, 0)
         s = self.evaluate(self.bank, core.trig_point(self.bank, core.open_quick(s, 0)))
         self.assertEqual(int(s.tg_e[0]), 0)
