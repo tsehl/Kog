@@ -1,0 +1,19 @@
+# external dependencies, installed by setup.sh
+oracle/ygopro-core/
+data/CardScripts/
+data/BabelCDB/
+.tools/
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+translate/cache/
+
+# generated reports (translate/inventory.py, translate/progress.py)
+translate/INVENTORY.md
+translate/PROGRESS.md
+translate/progress.json.gz
+
+# training outputs (README: --save runs/ckpt)
+runs/
