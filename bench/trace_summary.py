@@ -116,3 +116,19 @@ for kind in ("scatter", "gather"):
     print("  by source line:")
     for k, v in by_src.most_common(a.top):
         print(f"    {v / 1000 / nc:8.1f} ms  {k}")
+
+# all ops: exclusive time by op name (without the numeric suffix) and by engine source line
+by_name, n_name, by_line, n_line = (collections.Counter() for _ in range(4))
+for e in ops:
+    k = re.sub(r"[.\d]+$", "", e["name"])
+    by_name[k] += excl[id(e)]
+    n_name[k] += 1
+    src = re.sub(r"^.*/(engine/[\w.]+:\d+)$", r"\1", e.get("args", {}).get("source", "?"))
+    by_line[src] += excl[id(e)]
+    n_line[src] += 1
+print("\nexclusive time by op name (per call):")
+for k, v in by_name.most_common(a.top):
+    print(f"  {v / 1000 / nc:9.1f} ms {n_name[k] / nc:9.0f} ops  {k}")
+print("\nexclusive time by engine source line (per call):")
+for k, v in by_line.most_common(a.top):
+    print(f"  {v / 1000 / nc:9.1f} ms {n_line[k] / nc:9.0f} ops  {k}")

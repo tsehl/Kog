@@ -30,6 +30,12 @@ ap.add_argument("--proc", type=int, default=-1, help="procedural bank of seed X 
                 "random decks of 40 + 15) instead of the real cards")
 ap.add_argument("--profile", default="", help="directory for a profiler trace of a few calls after the measurement")
 ap.add_argument("--profile-calls", type=int, default=5)
+ap.add_argument("--layout", default="default", choices=("default", "auto", "bminor"),
+                help="memory layout of the arguments and outputs of step_batch: XLA's default (batch major), chosen by "
+                "the compiler (Layout.AUTO), or batch minor (batch axis last in memory: on TPU, the per-game ops fill "
+                "the 128 lanes whatever the trailing dimensions). The conversion of the inputs is not timed")
+ap.add_argument("--hlo", default="", help="writes the compiled HLO of step_batch to this file (bench/op_census.py "
+                "maps the ops of a trace to their engine source lines with it)")
 args = ap.parse_args()
 sys.path.insert(0, args.engine)
 
@@ -84,6 +90,23 @@ def run(b):
         sb0 = jax.jit(lambda bk, s, a: core.step_batch(bk, s, a, args.frac))
         sb = lambda s, a: sb0(bank, s, a)
         sb.lower = lambda *x: sb0.lower(bank, *x)
+    elif args.layout != "default":
+        from jax.experimental.layout import Format, Layout
+        from jax.sharding import SingleDeviceSharding
+        dev = SingleDeviceSharding(jax.devices()[0])
+
+        def fmt(x):
+            if args.layout == "auto":
+                return Format(Layout.AUTO, dev)
+            nd = len(x.shape)
+            return Format(Layout(major_to_minor=tuple(range(1, nd)) + (0,) if nd > 1 else (0,)), dev)
+        step = lambda s, a: core.step_batch(bank, s, a, args.frac)
+
+        def sb_lower(s, a):
+            out = jax.eval_shape(step, s, a)
+            return jax.jit(step, in_shardings=jax.tree.map(fmt, (s, a)),
+                           out_shardings=jax.tree.map(fmt, out)).lower(s, a)
+        sb = None
     else:
         sb = jax.jit(lambda s, a: core.step_batch(bank, s, a, args.frac))
     if args.compile_only:
@@ -93,7 +116,7 @@ def run(b):
         ng0.lower(d[0], d[1], k).compile() if args.extra else ng.lower(d, k).compile()
         sa = jax.eval_shape(ng, d, k)
         legal.lower(sa).compile()
-        sb.lower(sa, jax.ShapeDtypeStruct((b,), jnp.int32)).compile()
+        (sb.lower if sb is not None else sb_lower)(sa, jax.ShapeDtypeStruct((b,), jnp.int32)).compile()
         print(f"  B={b}: compiled in {time.time() - t0:.0f} s", flush=True)
         return
     t0 = time.time()
@@ -121,9 +144,20 @@ def run(b):
     if args.bank_arg:
         comp0 = sb0.lower(bank, s, f).compile()
         comp = lambda s, a: comp0(bank, s, a)
+    elif sb is None:
+        comp0 = sb_lower(s, f).compile()
+        comp = comp0
+        print(f"  B={b}: layout {args.layout}: input layouts of the state "
+              f"{sorted({str(x.layout.major_to_minor) for x in jax.tree.leaves(comp0.input_formats[0][0])})}", flush=True)
     else:
         comp0 = sb.lower(s, f).compile()
         comp = comp0
+    # inputs in the layouts of the compiled step_batch (converted outside the timed region)
+    fin = comp0.input_formats[0] if args.layout != "default" and not args.bank_arg else None
+    prep = (lambda s, a: jax.block_until_ready(jax.device_put((s, a), fin))) if fin else (lambda s, a: (s, a))
+    if args.hlo:
+        with open(args.hlo, "w") as fh:
+            fh.write(comp0.as_text())
     print(f"  B={b}: step_batch compiled in {time.time() - t1:.0f} s (new_game + legal {t_new:.0f} s)", flush=True)
     try:
         ma = comp0.memory_analysis()
@@ -146,6 +180,7 @@ def run(b):
     times, dec = [], 0
     for i in range(args.calls + 3):
         a, nd = policy(jax.random.fold_in(kk, i), m, f, s.done)
+        s, a = prep(s, a)
         t1 = time.time()
         s, m, f = sb(s, a)
         jax.block_until_ready(f)
@@ -164,7 +199,7 @@ def run(b):
         with jax.profiler.trace(out, create_perfetto_trace=True):
             for i in range(args.profile_calls):
                 a, _ = policy(jax.random.fold_in(kk, 10_000 + i), m, f, s.done)
-                s, m, f = sb(s, a)
+                s, m, f = sb(*prep(s, a))
                 jax.block_until_ready(f)
                 s, m, f = refill(s, m, f, pool, pm)
         print(f"  B={b}: trace of {args.profile_calls} calls in {out} (bench/trace_summary.py {out})", flush=True)
