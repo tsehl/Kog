@@ -524,6 +524,37 @@ def _i(x):
     return jnp.asarray(x, I32)
 
 
+# ---------------------------------------------------------------- dense replacements for scatters (TPU)
+# On TPU, scatters and gathers with computed indices run almost serially (~100-300 us each, measured), while dense
+# compares and reductions over small axes are nearly free. The helpers below replace the scatter idioms of the
+# engine by exact dense equivalents. The pairwise ones cost O(N^2) per game, which is small for N ~ 110.
+
+def onehot(idx, size):
+    """[..., size] bool: idx == k. Out-of-range indices match nothing (same as a scatter with mode="drop")."""
+    return idx[..., None] == jnp.arange(size)
+
+
+def set_true(idx, size, where=True):
+    """[size] bool: k is True iff some entry with idx == k (and `where`) exists. Equals
+    jnp.zeros(size, bool).at[idx].set(True, mode="drop") restricted to `where`."""
+    return (onehot(idx, size) & jnp.asarray(where)[..., None]).reshape(-1, size).any(0)
+
+
+def set_unique(idx, vals, size):
+    """[size] bool: vals[i] written at idx[i], False elsewhere; idx must be unique among the entries whose index is
+    in range. Equals jnp.zeros(size, bool).at[idx].set(vals, mode="drop")."""
+    return (onehot(idx, size) & vals[:, None]).any(0)
+
+
+def count_below(key, w, same=None):
+    """[N] int32: number of j with w[j] and key[j] < key[i] (and same[i, j] if given). Exact dense replacement of
+    the rank idiom bins = zeros.at[key].add(w); rank = (cumsum(bins) - bins)[key]."""
+    m = (key[None, :] < key[:, None]) & w[None, :]
+    if same is not None:
+        m &= same
+    return m.sum(1).astype(I32)
+
+
 def rel(p, r):
     """Relative player (0 = me, 1 = opponent) -> absolute."""
     return jnp.where(r == 0, p, 1 - p).astype(I32)
@@ -538,7 +569,7 @@ def count(s, zone, p):
 def zone_used(s, p, zone=Z_MZONE):
     """[8]: occupied zones of player p in the location (monsters 0-6, Spells/Traps 0-7)."""
     m = (s.zone == zone) & (s.ctrl == p)
-    return jnp.zeros(8, bool).at[jnp.where(m, s.seq, 8)].set(True, mode="drop")
+    return set_true(s.seq, 8, m)
 
 
 def free_main(s, p, zone=Z_MZONE):
@@ -564,9 +595,7 @@ def compact(s, leaving):
         oz = jnp.where(s.zone == z, i, oz)
     grp = s.ctrl * len(ORDERED) + jnp.maximum(oz, 0)
     hit = leaving & (oz >= 0)
-    bins = jnp.zeros((2 * len(ORDERED), n), I32).at[grp, s.seq].add(hit.astype(I32))
-    before = jnp.cumsum(bins, axis=1) - bins       # departing cards with strictly lower seq
-    shift = before[grp, s.seq]
+    shift = count_below(s.seq, hit, grp[None, :] == grp[:, None])  # departing cards of the group with lower seq
     return s._replace(seq=jnp.where((oz >= 0) & ~leaving, s.seq - shift, s.seq))
 
 
@@ -630,8 +659,7 @@ def group_send(s, mask, zone, pos, zone2=None, pos2=None, alt=None, reason=0):
     seq = s.seq
     for o in (0, 1):
         mo = mask & (s.owner == o)
-        bins = jnp.zeros(nk, I32).at[key].add(mo.astype(I32))
-        rank = (jnp.cumsum(bins) - bins)[key]
+        rank = count_below(key, mo)
         if alt is not None:
             rank = rank - jnp.where(alt, (mo & ~alt).sum(), 0)
             base2 = count(s, zone2, o)
@@ -665,10 +693,8 @@ def detach_fix(s):
     def fix(s):
         ov = s.zone == Z_OVERLAY
         par = jnp.clip(s.ov_par, 0, n - 1)
-        key = par * 8 + jnp.clip(s.seq, 0, 7)
-        cnt = jnp.zeros(8 * n, I32).at[key].add(ov.astype(I32))
-        cs = jnp.cumsum(cnt) - cnt
-        return s._replace(ov_par=jnp.where(gone, -1, s.ov_par), seq=jnp.where(ov, cs[key] - cs[par * 8], s.seq))
+        rank = count_below(jnp.clip(s.seq, 0, 7), ov, par[None, :] == par[:, None])  # same Xyz, lower rank
+        return s._replace(ov_par=jnp.where(gone, -1, s.ov_par), seq=jnp.where(ov, rank, s.seq))
     return _cond(gone.any(), fix, lambda s: s, s)
 
 
@@ -712,8 +738,7 @@ def attach(s, sel, par):
     """The cards in sel become the materials of the Xyz monster par, after those it already has, in creation order
     (card_set sorted by cardid: Duel.Overlay with sending the materials to the GY does not sort). O(N)."""
     n = s.cid.shape[0]
-    cnt = jnp.zeros(n, I32).at[s.uid].add(sel.astype(I32))
-    rank = (jnp.cumsum(cnt) - cnt)[s.uid]
+    rank = count_below(s.uid, sel)
     base = ((s.zone == Z_OVERLAY) & (s.ov_par == par)).sum()
     return s._replace(pzone=jnp.where(sel, s.zone, s.pzone), zone=jnp.where(sel, Z_OVERLAY, s.zone),
                       seq=jnp.where(sel, base + rank, s.seq), ov_par=jnp.where(sel, par, s.ov_par),
@@ -881,8 +906,9 @@ def trig_eval(bank, s):
             valid = jnp.arange(KC) < remaining.sum()
             passed = jax.vmap(lambda h, e, active: act_ok(
                 bank, s, h, e, s.ctrl[h], enabled=active, condition_only=initial))(ch, ce, valid) & valid
-            accepted |= jnp.zeros((E, n), I32).at[ce, ch].add(passed.astype(I32)) > 0
-            return remaining.at[ce, ch].set(False), accepted, rounds + 1
+            hit = onehot(ce, E)[:, :, None] & onehot(ch, n)[:, None, :]      # [KC, E, N]
+            accepted |= (hit & passed[:, None, None]).any(0)
+            return remaining & ~hit.any(0), accepted, rounds + 1
         _, ok, _ = lax.while_loop(more, batch, (candidates, jnp.zeros((E, n), bool), _i(0)))
         pending &= ~candidates | ok
         avail = (ok[None, :, :] & (stage[None, :, :] == jnp.arange(4)[:, None, None])).any((1, 2))
@@ -1606,7 +1632,7 @@ def fusion_ok(bank, s):
     def one(c, ok):
         cand = fus_cands(bank, s, c)                               # [FK, N]
         bits = (cand * (1 << jnp.arange(FK))[:, None]).sum(0)      # [N] possible slots of each card
-        hist = jnp.zeros(2 * nq, I32).at[bits + nq * field].add(1)  # [hand | field]
+        hist = onehot(bits + nq * field, 2 * nq).sum(0, dtype=I32)  # [hand | field]
         hh, hf = hist[:nq], hist[nq:]
         k = bank.fmn[s.cid[c]]
         use = (1 << k) - 1
@@ -1619,11 +1645,11 @@ def fusion_ok(bank, s):
         # without a free zone: a slot j must be held by a field monster (the cards in hand lose j)
         with_field = jnp.zeros((), bool)
         for j in range(FK):
-            hj = jnp.zeros(nq, I32).at[q & ~(1 << j)].add(hh)
+            hj = (onehot(q & ~(1 << j), nq) * hh[:, None]).sum(0, dtype=I32)
             with_field |= (j < k) & hall_h(hj, hf).all()
         return ok & ok_all & (ex_zones(s, s.owner[c]).any() | with_field)
     oks = jax.vmap(one)(idx, live)
-    return jnp.zeros(n, bool).at[jnp.where(live, idx, n)].set(oks, mode="drop"), want.sum() > EXK
+    return set_unique(jnp.where(live, idx, n), oks, n), want.sum() > EXK
 
 
 PERMS = [(0, 1, 2, 3), (0, 1, 3, 2), (0, 2, 1, 3), (0, 2, 3, 1), (0, 3, 1, 2), (0, 3, 2, 1), (1, 0, 2, 3), (1, 0, 3, 2), (1, 2, 0, 3), (1, 2, 3, 0), (1, 3, 0, 2), (1, 3, 2, 0), (2, 0, 1, 3), (2, 0, 3, 1), (2, 1, 0, 3), (2, 1, 3, 0), (2, 3, 0, 1), (2, 3, 1, 0), (3, 0, 1, 2), (3, 0, 2, 1), (3, 1, 0, 2), (3, 1, 2, 0), (3, 2, 0, 1), (3, 2, 1, 0)]
@@ -1688,7 +1714,7 @@ def fusion_sub_ok(bank, s):
         use = (1 << bank.fmn[s.cid[f]]) - 1
         return jnp.where(ex_zones(s, s.owner[f]).any(), any_sub[use, 0], field_sub[use, 0])
     ok = jax.vmap(one)(idx) & live
-    return jnp.zeros(n, bool).at[jnp.where(live, idx, n)].set(ok, mode="drop"), want.sum() > EXK
+    return set_unique(jnp.where(live, idx, n), ok, n), want.sum() > EXK
 
 
 def fusion_sub_picks(bank, s, f):
@@ -1904,7 +1930,7 @@ def synchro_ok(bank, s):
         L = bank.level[s.cid[c]]
         return ok & (tl & jax.vmap(lambda l: bit(b, L - l))(lvs)).any()
     oks = jax.vmap(one)(idx, live)
-    return jnp.zeros(n, bool).at[jnp.where(live, idx, n)].set(oks, mode="drop")
+    return set_unique(jnp.where(live, idx, n), oks, n)
 
 
 def syn_picks(bank, s, c):
@@ -1954,7 +1980,7 @@ def xyz_ok(bank, s):
     idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     oks = jax.vmap(lambda c, ok: ok & (xyz_mats(bank, s, c).sum() >= bank.xct[s.cid[c]]))(idx, live)
-    return jnp.zeros(n, bool).at[jnp.where(live, idx, n)].set(oks, mode="drop")
+    return set_unique(jnp.where(live, idx, n), oks, n)
 
 
 def has_xyz(bank, s):
@@ -2072,8 +2098,9 @@ def link_cells(bank, s, p):
     m = jnp.where(mine, m, _swap12(m))
     cell = jnp.where(mine, q, jnp.where(q < 5, q + 7, 11 - q))
     cell = jnp.where(on, cell, 12)
-    pt = jnp.zeros(12, I32).at[cell].add(m, mode="drop")                 # [12] zones designated by each zone
-    lk = jnp.zeros(12, bool).at[cell].set(True, mode="drop")             # zones held by a face-up Link
+    oc = onehot(cell, 12)                                                # [N, 12] (cell 12: none)
+    pt = (oc * m[:, None]).sum(0, dtype=I32)                             # [12] zones designated by each zone
+    lk = oc.any(0)                                                       # zones held by a face-up Link
     j = jnp.arange(12)
     mut = (((pt[:, None] >> j[None, :]) & 1) != 0) & (((pt[None, :] >> j[:, None]) & 1) != 0)
     M = jnp.where(mut, 1 << j[None, :], 0).sum(1).astype(I32)          # [12] co-linked neighbors
@@ -2177,7 +2204,7 @@ def link_ok(bank, s):
     def one(c, ok):
         return ok & link_valid(bank, s, c, tab).any()
     oks = jax.vmap(one)(idx, live)
-    return jnp.zeros(n, bool).at[jnp.where(live, idx, n)].set(oks, mode="drop")
+    return set_unique(jnp.where(live, idx, n), oks, n)
 
 
 def link_picks(bank, s, c):
@@ -2842,8 +2869,9 @@ def legal(bank, s, fus=True):
         ce, ch = jnp.nonzero(remaining, size=KC, fill_value=0)
         valid = jnp.arange(KC) < remaining.sum()
         passed = jax.vmap(lambda h, e, active: act_ok(bank, s, h, e, p, enabled=active))(ch, ce, valid) & valid
-        accepted |= jnp.zeros((E, n), I32).at[ce, ch].add(passed.astype(I32)) > 0
-        return remaining.at[ce, ch].set(False), accepted, rounds + 1
+        hit = onehot(ce, E)[:, :, None] & onehot(ch, n)[:, None, :]          # [KC, E, N]
+        accepted |= (hit & passed[:, None, None]).any(0)
+        return remaining & ~hit.any(0), accepted, rounds + 1
     _, ok, _ = lax.while_loop(more, batch, (cand, jnp.zeros((E, n), bool), _i(0)))
     verbs = jnp.concatenate([jnp.stack(verbs), cand & ok])
     sp = jnp.zeros(N_SPECIAL, bool)
