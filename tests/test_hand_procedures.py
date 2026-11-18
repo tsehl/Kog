@@ -74,7 +74,7 @@ class HandProceduresTests(unittest.TestCase):
         # erl=2 rejects the Revive even if proc is true; erl=1 allows it.
         for limit,proper,expected in ((1,False,False),(1,True,True),(2,False,False),(2,True,False)):
             bank=self.bank._replace(erl=self.bank.erl.at[0].set(limit),ctype=self.bank.ctype.at[0].set(core.TYPE_MONSTER|core.TYPE_SPSUMMON))
-            state=self.state._replace(proc=self.state.proc.at[0].set(proper))
+            state=core.with_cid(bank,self.state,self.state.cid)._replace(proc=self.state.proc.at[0].set(proper))
             self.assertFalse(bool(self.legal(bank,state)[0]))
             f=jnp.asarray(cards.F(me=core.Z_HAND,spsum=1))
             self.assertEqual(bool(core.filter_mask(bank,state,f,jnp.int32(0),jnp.int32(0))[0]),expected)

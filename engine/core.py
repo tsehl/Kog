@@ -580,6 +580,14 @@ def set_unique(idx, vals, size):
     return (onehot(idx, size) & vals[:, None]).any(0)
 
 
+def take(x, idx):
+    """x[idx] for x [n, ...] and in-range idx [...], as a one-hot selection (no gather: a gather of N indices is
+    slow on TPU). Out-of-range indices give 0."""
+    oh = onehot(idx, x.shape[0]).reshape(idx.shape + (x.shape[0],) + (1,) * (x.ndim - 1))
+    return jnp.where(oh, x, jnp.zeros((), x.dtype)).sum(idx.ndim, dtype=x.dtype) if x.dtype != jnp.bool_ \
+        else (oh & x).any(idx.ndim)
+
+
 def count_below(key, w, same=None):
     """[N] int32: number of j with w[j] and key[j] < key[i] (and same[i, j] if given). Exact dense replacement of
     the rank idiom bins = zeros.at[key].add(w); rank = (cumsum(bins) - bins)[key]."""
@@ -708,7 +716,7 @@ def group_send(s, mask, zone, pos, zone2=None, pos2=None, alt=None, reason=0):
     if alt is not None and zone2 == Z_EXTRA and pos2 == P_FD_DEF:  # the face-up Pendulums shift
         fu = (s.zone == Z_EXTRA) & (s.pos == P_FU_DEF) & ~mask
         nin = jnp.stack([(mask & alt & (s.owner == o)).sum() for o in (0, 1)])
-        s = s._replace(seq=jnp.where(fu, s.seq + nin[s.ctrl], s.seq))
+        s = s._replace(seq=jnp.where(fu, s.seq + jnp.where(s.ctrl == 0, nin[0], nin[1]), s.seq))
     out = (dest == Z_HAND) | (dest == Z_DECK) | (dest == Z_EXTRA)  # STATUS_PROC_COMPLETE lost
     s = s._replace(proc=jnp.where(mask & out, False, s.proc))
     return s._replace(pzone=jnp.where(mask, s.zone, s.pzone), zone=jnp.where(mask, dest, s.zone),
@@ -759,10 +767,11 @@ def drop_overlays(s):
     the group move), sorted by controller, Xyz seq then rank. Called by refresh: a single copy in the graph,
     instead of one per group_send call."""
     par = jnp.clip(s.ov_par, 0, s.cid.shape[0] - 1)
-    ovm = (s.zone == Z_OVERLAY) & (s.ov_par >= 0) & (s.zone[par] != Z_MZONE) & (s.mv[par] > s.mv)
+    ovm = (s.zone == Z_OVERLAY) & (s.ov_par >= 0) & (take(s.zone, par) != Z_MZONE) & (take(s.mv, par) > s.mv)
 
     def drop(s):  # only if there are any: refresh is called more often in step than in step_batch (clk, ev_p)
-        s2 = s._replace(seq=jnp.where(ovm, s.seq[par] * 8 + s.seq, s.seq), ctrl=jnp.where(ovm, s.ctrl[par], s.ctrl))
+        s2 = s._replace(seq=jnp.where(ovm, take(s.seq, par) * 8 + s.seq, s.seq),
+                        ctrl=jnp.where(ovm, take(s.ctrl, par), s.ctrl))
         s2 = group_send(s2, ovm, Z_GRAVE, P_GRAVE, reason=REASON_RULE | REASON_LOST_TARGET)
         return raise_ev(s2._replace(ov_par=jnp.where(ovm, -1, s2.ov_par)), EV_TO_GRAVE, ovm, s.tp)
     return _cond(ovm.any(), drop, lambda s: s, s)
@@ -1472,14 +1481,16 @@ def stats(bank, s):
     sgl = jnp.concatenate([jnp.zeros(KM, bool), jnp.ones(TM, bool)])[o]
     K = KM + TM
 
-    jj = jnp.arange(K)[:, None]
     sg2 = sgl[:, None]
 
-    def last(m):  # [K, N] -> [N]: index of the last true entry (-1: none)
-        return jnp.where(m.any(0), K - 1 - jnp.argmax(m[::-1], axis=0), -1)
+    def after(m):  # [K, N] -> [K, N]: no true entry at or after j (j > index of the last true entry)
+        return lax.cumsum(m.astype(I32), axis=0, reverse=True) == 0
 
-    def at(i):  # value of entry i for each card
-        return val[jnp.maximum(i, 0), idx]
+    def last(m):  # [K, N] -> [K, N]: one-hot of the last true entry per card (all False: none)
+        return m & (lax.cumsum(m.astype(I32), axis=0, reverse=True) == 1)
+
+    def at(mk):  # value of the selected entry for each card (dense selection, no gather)
+        return jnp.where(mk, val, 0).sum(0)
 
     def fold(base, upd, set_, fin, sbase):
         """Closed-form fold of card::get_attack (parallel over the entries, no sequential loop):
@@ -1491,21 +1502,17 @@ def stats(bank, s):
         sb_s, sb_c = is_(sbase) & sg2, is_(sbase) & ~sg2
         fin_s, fin_c = is_(fin) & sg2, is_(fin) & ~sg2
         set_m = is_(set_)
-        lc = last(sb_c)
-        b0 = jnp.where(lc >= 0, at(lc), jnp.maximum(base, 0))
-        lb = last(sb_s)
-        b = jnp.where(lb >= 0, at(lb), b0)
-        lx = last(set_m | fin_s | sb_s)
-        x = jnp.where((lx < 0) | sb_s[jnp.maximum(lx, 0), idx], -1, at(lx))
-        r_up = last((set_m & ~single[:, None]) | fin_s)
-        r_upc = last(fin_s)
+        b0 = jnp.where(sb_c.any(0), at(last(sb_c)), jnp.maximum(base, 0))
+        b = jnp.where(sb_s.any(0), at(last(sb_s)), b0)
+        mx = set_m | fin_s | sb_s
+        lx = last(mx)
+        x = jnp.where(~mx.any(0) | (lx & sb_s).any(0), -1, at(lx))
         u = is_(upd)
-        up = jnp.where(u & sg2 & (jj > r_up), val, 0).sum(0)
-        upc = jnp.where(u & ~sg2 & (jj > r_upc), val, 0).sum(0)
-        ll = last(fin_c)
+        up = jnp.where(u & sg2 & after((set_m & ~single[:, None]) | fin_s), val, 0).sum(0)
+        upc = jnp.where(u & ~sg2 & after(fin_s), val, 0).sum(0)
         cur = jnp.maximum(jnp.where(x < 0, b, x) + up + upc, 0)
         onx = onf & ~pst
-        return jnp.where(onx, jnp.maximum(jnp.where(ll >= 0, at(ll), cur), 0), base), jnp.where(onx, b, base)
+        return jnp.where(onx, jnp.maximum(jnp.where(fin_c.any(0), at(last(fin_c)), cur), 0), base), jnp.where(onx, b, base)
     atk, batk = fold(s.k_atk, MC_ATK, MC_SET_ATK, MC_FINAL_ATK, MC_BASE_ATK)
     df, _ = fold(s.k_df, MC_DEF, MC_SET_DEF, MC_FINAL_DEF, MC_BASE_DEF)
     df = jnp.where((s.k_ctype & TYPE_LINK) != 0, 0, df)  # card::get_defense: always 0 for a Link
@@ -1884,7 +1891,7 @@ def ritual_ok(bank, s):
             return g.astype(I32) | (e.astype(I32) << 1)
         res = jax.vmap(cls)(jnp.arange(LVMAX + 1))
         mine = (s.zone == Z_HAND) & (s.ctrl == p) & ((s.k_ctype & RIT_MON) == RIT_MON)
-        out = jnp.where(mine, res[lvc], out)
+        out = jnp.where(mine, take(res, lvc), out)
     return out
 
 
@@ -1911,7 +1918,7 @@ def rit_picks(bank, s, r, mode):
         g, e = sum_ok(h2, f2, req, u0 + l, jnp.minimum(mu0, l), jnp.where(room | hasf, 1, -1))
         return jnp.where(mode == RIT_GREATER, g, e)
     tab = jax.vmap(lambda isf: jax.vmap(lambda l: cls(l, isf))(jnp.arange(LVMAX + 1)))(jnp.array([False, True]))
-    return mats & ~sel & tab[field.astype(I32), lv]
+    return mats & ~sel & jnp.where(field, take(tab[1], lv), take(tab[0], lv))
 
 
 def rit_done(bank, s, r, mode):
@@ -1990,7 +1997,7 @@ def syn_picks(bank, s, c):
     b1 = reach(h, 1)
     tun = jax.vmap(lambda l: bit(b1, L - l))(lvs)                  # Tuner of Level l
     ntv = jax.vmap(lambda l: bit(reach(h - (lvs == l), 0), L - u - l))(lvs)  # non-Tuner of Level l
-    return jnp.where(has_t, nt & ~sel & ntv[lv], t & ~sel & tun[lv])
+    return jnp.where(has_t, nt & ~sel & take(ntv, lv), t & ~sel & take(tun, lv))
 
 
 def syn_done(bank, s):
@@ -2152,7 +2159,7 @@ def link_cells(bank, s, p):
 def colinked(bank, s):
     """[N]: Link monsters co-linked with at least one other (card::get_mutual_linked_cards non-empty). O(N + 144)."""
     cell, _, _, M = link_cells(bank, s, 0)
-    return (cell < 12) & (M[jnp.clip(cell, 0, 11)] != 0)
+    return (cell < 12) & (take(M, cell) != 0)
 
 
 def extra_link(bank, s, p, sub):

@@ -106,7 +106,7 @@ class SpecialResolutionTests(unittest.TestCase):
     def test_pending_link_has_no_arrows_or_colinks_until_group_completion(self):
         bank=self.bank._replace(ctype=self.bank.ctype.at[0].set(core.TYPE_MONSTER|core.TYPE_LINK),
             lmark=self.bank.lmark.at[0].set(core.LM_BL|core.LM_BR))
-        s=self.state._replace(zone=self.state.zone.at[5].set(core.Z_MZONE),
+        s=core.with_cid(bank,self.state,self.state.cid)._replace(zone=self.state.zone.at[5].set(core.Z_MZONE),
             seq=self.state.seq.at[5].set(5),pos=self.state.pos.at[5].set(core.P_FU_ATK),
             st=self.state.st.at[5].set(core.ST_PSTEP))
         self.assertFalse(bool(core.link_arrows(bank,s,0).any()))

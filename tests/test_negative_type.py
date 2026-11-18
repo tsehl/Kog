@@ -11,7 +11,7 @@ class NegativeTypeTests(unittest.TestCase):
     def test_material_filter_can_include_and_exclude_types(self):
         bank=core.make_bank(np.array([1,2,3]),[500,500,0],[500,500,0],[4,4,0],
             ctype=[core.TYPE_MONSTER|core.TYPE_NORMAL,core.TYPE_MONSTER|cards.TYPE_EFFECT,core.TYPE_SPELL])
-        state=SimpleNamespace(cid=jnp.array([0,1,2]))
+        cid=jnp.array([0,1,2]); state=SimpleNamespace(cid=cid,**core.slot_fields(bank,cid))
         actual=core.mat_mask(bank,state,jnp.asarray(cards.MAT(typ=core.TYPE_MONSTER,not_typ=cards.TYPE_EFFECT)))
         np.testing.assert_array_equal(actual,[True,False,False])
     def test_not_type_combines_with_positive_and_other_exclusions(self):
