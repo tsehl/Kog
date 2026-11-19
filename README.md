@@ -1,15 +1,16 @@
-# Kog
+# Project Kog
 
-**Kog** ("King of Games") is a Yu-Gi-Oh! rules engine written in pure JAX, plus a PPO self-play agent trained on it.
-The engine is vectorised with `vmap`, so thousands of duels run in parallel on one GPU.
+**Project Kog** is a Yu-Gi-Oh! rules engine written in pure JAX, together with **Kog** ("King of Games"), a PPO
+self-play agent trained on it. The engine is vectorised with `vmap`, so thousands of duels run in parallel on one
+accelerator.
 
-The agent never sees a real card during training:
+Kog never sees a real card during training:
 - cards and decks are generated procedurally;
 - every card effect is decomposed into atomic *bricks* (cost, target, filter, move, modify, trigger, ...), and the
   network reads these bricks directly.
 
-The model therefore has to understand effect trees rather than memorise card identifiers. Real cards are only used as
-a held-out benchmark.
+The network therefore has to understand effect trees rather than memorise card identifiers. Real cards are only used
+as a held-out benchmark.
 
 **The goal is the complete game. The engine is not there yet.** The core rules and every summoning mechanic are in
 place and checked against the reference engine. However, several card mechanics are still missing, and only 7.4% of
@@ -159,6 +160,11 @@ speed. Concretely:
   limited by the amount of work per game, not by the number of operations.
 - *Imposing a memory layout* (game axis last): no measurable effect.
 
+**Training on TPU.** Kog's full PPO loop (rollout and update) runs on one v5e chip: about 1,300–1,600 decisions per
+second at 1,024 games with 16-step rollouts (`train/ppo.py --b 1024 --steps 16 --bf16`, 6 iterations after
+compilation). Each `act_step` call (policy plus engine) takes 300–330 ms and the update about 5–7 s per iteration. This
+shows that training runs and fits in the chip's memory; it says nothing yet about learning quality on TPU.
+
 **Next steps.** At 212 ms per call, the remaining time splits as follows:
 
 | part | ms per call |
@@ -177,15 +183,21 @@ The work planned next:
   the oracle and still have to be measured on TPU.
 
 The target is to at least match the L4 per chip, i.e. at most 100 ms per call. Each chip plays its own games, so the
-throughput then adds up across the chips of a pod slice.
+throughput should then add up across the chips of a pod slice. This has not been measured yet; the tools are ready:
+- `bench/tpu_parity.py` plays the same games on the accelerator and on the CPU and checks that every state field is
+  bit-identical after each call (the oracle checks run on the CPU);
+- `bench/engine_bench.py --devices N` shards the games over N chips, and `--barrier` lets N single-chip processes
+  measure at the same time;
+- `cloud/kaggle_tpu.py` packs these measurements, plus a few PPO iterations, into one job for a Kaggle TPU v5e-8.
 
-### Agent
+### Kog, the agent
 
-**Architecture.**
-- A small transformer encodes each card from its brick tokens: header, one token per effect, per instruction and per
-  filter.
-- A second transformer reads the visible game state: one token per card, with its zone, position, current stats and
-  status. It outputs the policy and the value.
+**Architecture.** The network is deliberately small: 1.3 million parameters, width 128.
+- A 2-layer transformer encodes each card from its brick tokens: header, one token per effect, per instruction and
+  per filter. ATK, DEF and Level are also given as thermometer and one-hot features.
+- A 3-layer transformer reads the visible game state: one token per card, with its zone, position, current stats and
+  status. It outputs the policy and the value. The activation head reads the effect tokens of the card encoder, so no
+  weight depends on the number of effects per card.
 
 **Training.**
 - PPO self-play on procedural cards and decks.
@@ -200,10 +212,22 @@ throughput then adds up across the chips of a pod slice.
 | player | vs random, reference | vs heuristic, reference | vs heuristic, archetype |
 |---|---:|---:|---:|
 | scripted heuristic | 87.9% | — | — |
-| agent, 120 iterations | 98.4% | 73.0% | 66.2% |
-| agent, 360 iterations (`train/ckpt/run5_it360_f16.pkl.gz`) | 100% | **83.9%** | **79.8%** |
+| Kog, 120 iterations | 98.4% | 73.0% | 66.2% |
+| Kog, 360 iterations (`train/ckpt/run5_it360_f16.pkl.gz`) | 100% | **83.9%** | **79.8%** |
 
-On the archetype decks, the heuristic beats random 92.7% of the time.
+On the archetype decks, the heuristic beats random 92.7% of the time. These agents were trained and evaluated on one
+L4 GPU, with the engine as it was before the TPU work.
+
+## Roadmap
+
+- **The complete game.** Implement the missing mechanics listed above, and grow the translator so that larger
+  real-card benchmarks become possible.
+- **The TPU engine.** Reach at least L4 speed per chip, then measure the scaling across the chips of a slice and check
+  TPU/CPU parity.
+- **Self-play at scale.** Data-parallel PPO: every chip simulates its own games, gradients are averaged for the
+  update. Runs much longer than the 360 iterations done so far on one GPU.
+- **Scaling Kog.** Train larger networks, with several seeds per size, and measure held-out performance against
+  model size, simulation volume and the diversity of procedural cards.
 
 ## Layout
 
@@ -213,9 +237,9 @@ On the archetype decks, the heuristic beats random 92.7% of the time.
 | `oracle/` | ctypes driver for ygopro-core, rule test scripts, build notes |
 | `gen/` | procedural card and deck generator, Lua compiler for generated cards, fuzzing |
 | `translate/` | translator from official Lua scripts to bricks, validation against the oracle |
-| `train/` | network (`model.py`), PPO self-play (`ppo.py`), real-card benchmark banks, evaluation and behaviour probes |
-| `bench/` | throughput and profiling tools |
-| `cloud/` | launcher for GPU jobs on Modal |
+| `train/` | Kog's network (`model.py`), PPO self-play (`ppo.py`), real-card benchmark banks, evaluation and behaviour probes |
+| `bench/` | throughput, profiling and TPU parity tools |
+| `cloud/` | launchers for remote runs: GPU on Modal, TPU v5e-8 on Kaggle |
 | `tests/` | unit tests and oracle cross-checks |
 
 ## Setup
@@ -241,10 +265,13 @@ uv run --with jax --with luaparser --with optax python -m unittest discover -s t
 # full regression against the oracle, then the batching consistency checks (CPU, a few hours)
 bash engine/regress.sh /tmp/regress
 
-# engine throughput
+# engine throughput (GPU; on TPU, use 'jax[tpu]')
 uv run --with 'jax[cuda12]' python bench/engine_bench.py engine --extra 15 --b 1024,4096
 
-# training with the configuration of the 360-iteration agent (one L4, about 2 hours)
+# TPU: bit-identical states on the accelerator and on the CPU
+uv run --with 'jax[tpu]' python bench/tpu_parity.py engine --b 64 --calls 80
+
+# train Kog with the configuration of the 360-iteration run (one L4, about 2 hours)
 uv run --with 'jax[cuda12]' --with optax python train/ppo.py --b 1024 --steps 64 --mb 8 --bf16 \
     --mix-heur 0.2 --mix-old 0.2 --iters 360 --eval-every 40 --old-lag 120 --save runs/ckpt
 
@@ -262,6 +289,10 @@ dependencies:
 - `train/realbank*.npz` are the real-card benchmark banks.
 
 Both can be rebuilt with `gen/skeleton.py` and `train/realcards.py`.
+
+Two checkpoints of Kog ship as well (float16, gzipped pickles): `train/ckpt/run5_it360_f16.pkl.gz` is the 360-iteration
+agent of the table above, and `train/ckpt/run3_it120_f16.pkl.gz` an earlier 120-iteration run, kept for the
+checkpoint-compatibility tests.
 
 ## Notes
 
