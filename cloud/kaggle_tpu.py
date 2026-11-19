@@ -3,8 +3,9 @@
 Locally:   python cloud/kaggle_tpu.py push --commit SHA [--repo URL] [--timeout 9000] [--only parity,bench1]
            kaggle kernels status USER/kog-tpu ; kaggle kernels logs USER/kog-tpu ;
            kaggle kernels output USER/kog-tpu -p OUT_DIR       (logs of each step and summary.txt)
-The commit must be pushed to the (public) repository: the Kaggle session clones it, installs JAX for TPU, then runs
-the steps one after the other, each with its own time limit, and writes STEP.log and summary.txt to /kaggle/working.
+The code of the commit is embedded in the job (git archive, base64): Kaggle sessions may have no internet access.
+With internet, JAX for TPU is installed at the version of the Colab measurements; without, the preinstalled one is
+used. The steps run one after the other, each with its own time limit, and writes STEP.log and summary.txt to /kaggle/working.
 Needs the Kaggle CLI, authenticated (~/.kaggle/access_token or kaggle.json), on an account allowed to use TPUs
 (Kaggle asks for phone and identity verification first).
 
@@ -29,8 +30,11 @@ import time
 REPO = "https://github.com/tsehl/Kog.git"      # replaced by push
 COMMIT = ""                                     # replaced by push
 ONLY = ""                                       # replaced by push (empty: every step)
+CODE = ""                                       # replaced by push: base64 tar.gz of the code at COMMIT (sessions
+                                                # without internet access cannot clone)
 JAX = "0.11.2"                                  # version of the Colab TPU measurements
 KERNEL = "kog-tpu"
+NOTIFY = ""                                     # replaced by push --notify URL (never committed): progress messages
 
 STEPS = [
     ("parity", "python bench/tpu_parity.py engine --b 64 --calls 80", 2400),
@@ -41,6 +45,18 @@ STEPS = [
 ]
 
 
+def notify(msg):
+    """POSTs a progress line (measurement numbers only) to the --notify URL; silent if there is none or it fails.
+    Kaggle shows the logs of a finished run only, this is the way to follow a long one."""
+    if not NOTIFY:
+        return
+    try:
+        import urllib.request
+        urllib.request.urlopen(urllib.request.Request(NOTIFY, data=msg[:3500].encode(), method="POST"), timeout=10).close()
+    except Exception as e:  # noqa: BLE001
+        print(f"(notification failed: {e})", flush=True)
+
+
 def sh(cmd, log=None, timeout=None, cwd=None):
     """Runs cmd, copies its output to stdout (visible with `kaggle kernels logs`) and to log; returns (code, last lines)."""
     print(f"\n$ {cmd}", flush=True)
@@ -49,6 +65,13 @@ def sh(cmd, log=None, timeout=None, cwd=None):
     p = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          start_new_session=True)
     tail, killed = [], []
+
+    def beat():  # every 5 minutes: the last line of the step
+        if p.poll() is None:
+            notify(f"[{time.time() - t0:.0f} s] {tail[-1] if tail else '...'}")
+            threading.Timer(300, beat).start()
+    if NOTIFY and log:
+        threading.Timer(300, beat).start()
     if timeout:  # watchdog: also kills a step that hangs without printing anything
         timer = threading.Timer(timeout, lambda: (killed.append(1), os.killpg(p.pid, 9)))
         timer.start()
@@ -118,11 +141,34 @@ def on_kaggle():
     out = "/kaggle/working"
     src = os.path.join(tempfile.gettempdir(), "kog")
     summary = [f"repo {REPO} commit {COMMIT}"]
-    code, _ = sh(f"git clone -q {REPO} {src} && cd {src} && git checkout -q {COMMIT} && git log --oneline -1")
-    assert code == 0, "clone failed"
-    sh(f'pip install -q "jax[tpu]=={JAX}" optax 2>&1 | tail -3')
-    _, env = sh('python -c "import jax; print(jax.__version__, jax.devices())"; nproc; free -g | head -2')
+    import base64
+    import io
+    import socket
+    import tarfile
+    os.makedirs(src, exist_ok=True)
+    tarfile.open(fileobj=io.BytesIO(base64.b64decode(CODE)), mode="r:gz").extractall(src, filter="data")
+    try:
+        socket.create_connection(("pypi.org", 443), timeout=5).close()
+        net = True
+    except OSError:
+        net = False
+    summary.append(f"internet: {'yes' if net else 'no (preinstalled JAX)'}")
+    if net:
+        sh(f'pip install -q "jax[tpu]=={JAX}" optax 2>&1 | tail -3')
+    _, env = sh('python -c "import jax; print(jax.__version__, jax.devices())"; python -c "import optax; '
+                'print(\'optax\', optax.__version__)"; nproc; free -g | head -2; echo "devices:"; ls /dev | grep -iE "accel|vfio|tpu" || echo "  (no accel / vfio / tpu device file)"; '
+                'env | grep -E "^TPU_|^CLOUD_TPU|^KAGGLE_.*(TPU|ACCEL)" || echo "  (no TPU env var)"')
     summary += env
+    notify("session started: " + " | ".join(x for x in env if "jax" in x.lower() or x[:1].isdigit())[:400])
+    plat = subprocess.run('python -c "import jax; print(jax.devices()[0].platform)"', shell=True, capture_output=True,
+                          text=True).stdout.strip().splitlines()
+    if not plat or plat[-1] != "tpu":  # without the accelerator nothing below is worth the session time
+        summary.append("NO TPU in this session: stopped (accelerator not granted; Kaggle needs a verified account "
+                       "and TPU quota)")
+        with open(os.path.join(out, "summary.txt"), "w") as f:
+            f.write("\n".join(summary) + "\n")
+        print("\n".join(summary), flush=True)
+        sys.exit(1)
     for name, cmd, limit in STEPS:
         if ONLY and name not in ONLY.split(","):
             continue
@@ -133,6 +179,7 @@ def on_kaggle():
         else:
             code, tail = sh(cmd, os.path.join(out, f"{name}.log"), limit, cwd=src)
         summary += ["", f"== {name} (exit {code}, {time.time() - t0:.0f} s): {cmd}"] + tail
+        notify(f"== {name}: exit {code}, {time.time() - t0:.0f} s\n" + "\n".join(tail))
         with open(os.path.join(out, "summary.txt"), "w") as f:  # rewritten after each step: kept if the session dies
             f.write("\n".join(summary) + "\n")
     print("\n".join(summary), flush=True)
@@ -145,13 +192,31 @@ def push(a):
     d = tempfile.mkdtemp()
     code = open(__file__).read()
     code = code.replace('COMMIT = ""', f'COMMIT = "{a.commit}"', 1).replace(f'REPO = "{REPO}"', f'REPO = "{a.repo}"', 1)
-    code = code.replace('ONLY = ""', f'ONLY = "{a.only}"', 1)
-    open(os.path.join(d, "job.py"), "w").write(code)
-    json.dump({"id": f"{user}/{KERNEL}", "title": KERNEL, "code_file": "job.py", "language": "python",
-               "kernel_type": "script", "is_private": True, "enable_gpu": False, "enable_tpu": True,
-               "enable_internet": True, "dataset_sources": [], "competition_sources": [], "kernel_sources": []},
+    code = code.replace('ONLY = ""', f'ONLY = "{a.only}"', 1).replace('NOTIFY = ""', f'NOTIFY = "{a.notify}"', 1)
+    import base64
+    tgz = subprocess.run(f"git archive {a.commit} engine bench gen 'train/*.py' --format=tar.gz", shell=True,
+                         capture_output=True, check=True, cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                           "..")).stdout
+    code = code.replace('CODE = ""', f'CODE = "{base64.b64encode(tgz).decode()}"', 1)
+    if a.notebook:  # a one-cell notebook that runs the same code
+        cell = code.split('\nif __name__ == "__main__":')[0] + "\non_kaggle()\n"
+        nb = {"cells": [{"cell_type": "code", "metadata": {}, "execution_count": None, "outputs": [],
+                         "source": cell.splitlines(True)}],
+              "metadata": {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"}},
+              "nbformat": 4, "nbformat_minor": 5}
+        json.dump(nb, open(os.path.join(d, "job.ipynb"), "w"))
+    else:
+        open(os.path.join(d, "job.py"), "w").write(code)
+    json.dump({"id": f"{user}/{KERNEL}", "title": KERNEL, "code_file": "job.ipynb" if a.notebook else "job.py",
+               "language": "python", "kernel_type": "notebook" if a.notebook else "script", "is_private": True, "enable_gpu": False, "enable_tpu": True,
+               "enable_internet": True, "docker_image_pinning_type": "latest", "dataset_sources": [], "competition_sources": [], "kernel_sources": []},
               open(os.path.join(d, "kernel-metadata.json"), "w"))
-    r = subprocess.run(["kaggle", "kernels", "push", "-p", d, "--accelerator", "TpuV5E8", "-t", str(a.timeout)])
+    meta = json.load(open(os.path.join(d, "kernel-metadata.json")))
+    meta["enable_tpu"] = a.acc != "none-flag-only"   # variants: flag only / shape only / both (default)
+    json.dump(meta, open(os.path.join(d, "kernel-metadata.json"), "w"))
+    acc = [] if a.acc == "flag" else ["--accelerator", "TpuV5E8"]
+    r = subprocess.run(["kaggle", "kernels", "push", "-p", d, "-t", str(a.timeout)] + acc
+                       + (["--no-run"] if a.no_run else []))
     shutil.rmtree(d)
     sys.exit(r.returncode)
 
@@ -166,5 +231,13 @@ if __name__ == "__main__":
         ap.add_argument("--repo", default=REPO)
         ap.add_argument("--user", default="", help="Kaggle user name (default: kaggle config view)")
         ap.add_argument("--timeout", type=int, default=9000, help="hard limit of the Kaggle session, in seconds")
+        ap.add_argument("--notify", default="", help="URL that receives a POST with the progress of the run (kept out "
+                        "of the repository; the job code on Kaggle is private)")
+        ap.add_argument("--acc", default="both", choices=["both", "flag", "none-flag-only"],
+                        help="how the TPU is requested: enable_tpu + --accelerator (both), enable_tpu only (flag), "
+                        "--accelerator only (none-flag-only)")
+        ap.add_argument("--notebook", action="store_true", help="push a notebook instead of a script")
+        ap.add_argument("--no-run", action="store_true", help="upload without running (then run it from the web page: "
+                        "the API has given CPU sessions despite the TPU request)")
         ap.add_argument("--only", default="", help="comma-separated steps (default: all)")
         push(ap.parse_args())
