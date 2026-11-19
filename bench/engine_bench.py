@@ -9,6 +9,8 @@ A decision = an action chosen by the policy (the forced actions returned by step
 Finished games are replaced by new games (pre-generated pool), to keep the batch full.
 --profile DIR: after the measurement, records a profiler trace of --profile-calls calls in DIR (summarise it with
 bench/trace_summary.py). The memory and cost analysis of the compiled step_batch is always printed.
+--devices N: N chips (e.g. TPU v5e-8), --b games on each; XLA_FLAGS=--xla_force_host_platform_device_count=N
+rehearses it on the CPU.
 --compile-only: compile without measuring. Several engines on the same GPU: run the --compile-only runs in parallel
 (XLA_PYTHON_CLIENT_PREALLOCATE=false), then the measurements one by one, which read the cache (YGO_JAX_CACHE).
 """
@@ -30,6 +32,10 @@ ap.add_argument("--proc", type=int, default=-1, help="procedural bank of seed X 
                 "random decks of 40 + 15) instead of the real cards")
 ap.add_argument("--profile", default="", help="directory for a profiler trace of a few calls after the measurement")
 ap.add_argument("--profile-calls", type=int, default=5)
+ap.add_argument("--barrier", default="", help="DIR:N: after compiling, wait until N processes have reached the "
+                "barrier (files in DIR) before measuring, so that N processes on N chips measure at the same time")
+ap.add_argument("--devices", type=int, default=1, help="chips used: each one plays its own --b games (shard_map over the "
+                "game axis, no communication between chips); decisions/s are given in total and per chip")
 ap.add_argument("--layout", default="default", choices=("default", "auto", "bminor"),
                 help="memory layout of the arguments and outputs of step_batch: XLA's default (batch major), chosen by "
                 "the compiler (Layout.AUTO), or batch minor (batch axis last in memory: on TPU, the per-game ops fill "
@@ -47,6 +53,26 @@ import cards  # noqa: E402
 import core  # noqa: E402
 
 D, C = 40, 670
+ND = args.devices
+if ND > 1:
+    from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
+    assert len(jax.devices()) >= ND, f"{len(jax.devices())} devices available, --devices {ND}"
+    mesh = jax.make_mesh((ND,), ("d",), devices=jax.devices()[:ND])
+    on_mesh = lambda t: jax.device_put(t, NamedSharding(mesh, P("d")))  # leading (game) axis split over the chips
+
+    def smap(fn, in_specs=P("d")):
+        """fn applied to each chip's games separately (step_batch mixes the games of its batch: sub-batches, loop
+        conditions; sharding it automatically would add communication between chips)."""
+        try:
+            from jax import shard_map
+            return shard_map(fn, mesh=mesh, in_specs=in_specs, out_specs=P("d"), check_vma=False)
+        except ImportError:
+            from jax.experimental.shard_map import shard_map
+            return shard_map(fn, mesh, in_specs=in_specs, out_specs=P("d"), check_rep=False)
+else:
+    P = None
+    on_mesh = lambda t: t
+    smap = lambda fn, in_specs=None: fn
 key = jax.random.PRNGKey(0)
 if args.proc >= 0:
     import os
@@ -63,7 +89,7 @@ for name in ("J4", "J4B", "J4C", "J4D"):
     new |= getattr(cards, name, set())
 fus = set(getattr(cards, "FUSION", {})) | set(getattr(cards, "SYNCHRO", {})) | set(getattr(cards, "XYZ", {})) | set(getattr(cards, "LINK", {}))  # Extra Deck: never in the main deck
 eff = np.array([i for i in range(C, len(codes)) if not (args.old_cards and int(codes[i]) in new) and int(codes[i]) not in fus])
-print(f"jax {jax.__version__} {jax.devices()[0].device_kind} ; bank {len(codes)} cards, {len(eff)} drawable effect cards",
+print(f"jax {jax.__version__} {jax.devices()[0].device_kind} x {len(jax.devices())} visible ; bank {len(codes)} cards, {len(eff)} drawable effect cards",
       flush=True)
 
 
@@ -80,12 +106,13 @@ def decks(k, b):
 
 
 def run(b):
+    b0, b = b, b * ND  # b games per chip
     if args.extra:
         ng0 = jax.jit(jax.vmap(lambda d, x, k: core.new_game(bank, d[0], d[1], k, x[0], x[1])))
         ng = lambda dx, k: ng0(dx[0], dx[1], k)
     else:
         ng = jax.jit(jax.vmap(lambda d, k: core.new_game(bank, d[0], d[1], k)))
-    legal = jax.jit(jax.vmap(lambda s: core.legal(bank, s)))
+    legal = jax.jit(smap(jax.vmap(lambda s: core.legal(bank, s))))
     if args.bank_arg:
         sb0 = jax.jit(lambda bk, s, a: core.step_batch(bk, s, a, args.frac))
         sb = lambda s, a: sb0(bank, s, a)
@@ -108,7 +135,7 @@ def run(b):
                            out_shardings=jax.tree.map(fmt, out)).lower(s, a)
         sb = None
     else:
-        sb = jax.jit(lambda s, a: core.step_batch(bank, s, a, args.frac))
+        sb = jax.jit(smap(lambda s, a: core.step_batch(bank, s, a, args.frac)))
     if args.compile_only:
         t0 = time.time()
         d = decks(jax.random.fold_in(key, 1), b)
@@ -120,24 +147,25 @@ def run(b):
         print(f"  B={b}: compiled in {time.time() - t0:.0f} s", flush=True)
         return
     t0 = time.time()
-    s = ng(decks(jax.random.fold_in(key, 1), b), jax.random.split(jax.random.fold_in(key, 2), b))
-    pool = ng(decks(jax.random.fold_in(key, 3), b), jax.random.split(jax.random.fold_in(key, 4), b))
+    s = on_mesh(ng(decks(jax.random.fold_in(key, 1), b), jax.random.split(jax.random.fold_in(key, 2), b)))
+    pool = on_mesh(ng(decks(jax.random.fold_in(key, 3), b), jax.random.split(jax.random.fold_in(key, 4), b)))
     m = legal(s)
     pm = legal(pool)
     jax.block_until_ready(pm)
     t_new = time.time() - t0
-    f = jnp.full(b, -1, jnp.int32)
+    f = on_mesh(jnp.full(b, -1, jnp.int32))
 
-    @jax.jit
-    def policy(k, m, f, done):
+    def policy0(k, m, f, done):  # random legal action; per game: is it a policy decision
         a = jax.random.categorical(k, jnp.where(m, 0.0, -1e9))
-        return jnp.where(f >= 0, f, a).astype(jnp.int32), ((f < 0) & ~done).sum()
+        return jnp.where(f >= 0, f, a).astype(jnp.int32), (f < 0) & ~done
+    pol = jax.jit(smap(policy0, in_specs=(None if P is None else (P(), P("d"), P("d"), P("d")))))
+    policy = lambda *x: (lambda a, d: (a, d.sum()))(*pol(*x))
 
-    @jax.jit
-    def refill(s, m, f, pool, pm):
+    def refill0(s, m, f, pool, pm):
         d = s.done
         w = lambda x, y: jnp.where(d.reshape(d.shape + (1,) * (x.ndim - 1)), y, x)
         return jax.tree.map(w, s, pool), w(m, pm), jnp.where(d, -1, f)
+    refill = jax.jit(smap(refill0))
 
     # compile ahead of time: the compiled object gives the memory / cost analysis, and the calls below use it
     t1 = time.time()
@@ -177,7 +205,18 @@ def run(b):
     sb = comp
 
     kk = jax.random.fold_in(key, 5)
+    if args.barrier:
+        import os
+        bdir, bn = args.barrier.rsplit(":", 1)
+        os.makedirs(bdir, exist_ok=True)
+        open(os.path.join(bdir, f"{os.getpid()}.{b}"), "w").close()
+        t1 = time.time()
+        while len([x for x in os.listdir(bdir) if x.endswith(f".{b}")]) < int(bn):
+            assert time.time() - t1 < 1500, "barrier: the other processes did not arrive within 25 min"
+            time.sleep(0.2)
+        print(f"  B={b}: barrier passed after {time.time() - t1:.0f} s", flush=True)
     times, dec = [], 0
+    t_start = time.time()
     for i in range(args.calls + 3):
         a, nd = policy(jax.random.fold_in(kk, i), m, f, s.done)
         s, a = prep(s, a)
@@ -193,7 +232,9 @@ def run(b):
         s, m, f = refill(s, m, f, pool, pm)
     tot = sum(times)
     print(f"  B={b}: {dec / tot:,.0f} decisions/s ; {1000 * tot / len(times):.1f} ms/call ; "
-          f"{dec / len(times):.0f} decisions/call", flush=True)
+          f"{dec / len(times):.0f} decisions/call ; measured from {t_start:.1f} to {time.time():.1f} (epoch s)", flush=True)
+    if ND > 1:
+        print(f"  B={b} = {ND} chips x {b0}: {dec / tot / ND:,.0f} decisions/s per chip", flush=True)
     if args.profile:
         out = f"{args.profile}/B{b}"
         with jax.profiler.trace(out, create_perfetto_trace=True):
