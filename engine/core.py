@@ -588,6 +588,19 @@ def take(x, idx):
         else (oh & x).any(idx.ndim)
 
 
+def nonzero(mask, size, fill_value=0):
+    """Same as jnp.nonzero(mask, size=size, fill_value=fill_value), without a scatter (jnp.nonzero scatters every
+    entry of the mask: the main cost of step_batch on TPU after the histograms). The k-th index is a one-hot
+    selection on the rank (cumsum) of the true entries. O(size x mask.size)."""
+    flat = mask.reshape(-1)
+    rank = jnp.cumsum(flat.astype(I32)) - 1
+    hit = flat[None, :] & (rank[None, :] == jnp.arange(size, dtype=I32)[:, None])  # [size, M]
+    found = hit.any(1)
+    pos = jnp.where(hit, jnp.arange(flat.shape[0], dtype=I32)[None, :], 0).sum(1, dtype=I32)
+    coords = (pos,) if mask.ndim == 1 else jnp.unravel_index(pos, mask.shape)
+    return tuple(jnp.where(found, c, fill_value).astype(I32) for c in coords)
+
+
 def count_below(key, w, same=None):
     """[N] int32: number of j with w[j] and key[j] < key[i] (and same[i, j] if given). Exact dense replacement of
     the rank idiom bins = zeros.at[key].add(w); rank = (cumsum(bins) - bins)[key]."""
@@ -945,7 +958,7 @@ def trig_eval(bank, s):
             return remaining.any() & (rounds < ACT_ROUNDS)
         def batch(batch_carry):
             remaining, accepted, rounds = batch_carry
-            ce, ch = jnp.nonzero(remaining, size=KC, fill_value=0)
+            ce, ch = nonzero(remaining, size=KC, fill_value=0)
             valid = jnp.arange(KC) < remaining.sum()
             passed = jax.vmap(lambda h, e, active: act_ok(
                 bank, s, h, e, s.ctrl[h], enabled=active, condition_only=initial))(ch, ce, valid) & valid
@@ -1412,7 +1425,7 @@ def stats(bank, s):
     act = (k == K_CONT) & ((s.k_erng & s.zone[:, None]) != 0) & srcok[:, None] & bdok
     if bank.submat.shape[1]:
         act &= md[..., M_CODE] != MC_FUS_SUB  # passive property, no slot of stats()/KM
-    flat = jnp.nonzero(act.reshape(-1), size=KM, fill_value=0)[0]  # card then effect order
+    flat = nonzero(act.reshape(-1), size=KM, fill_value=0)[0]  # card then effect order
     hs, es = flat // E, flat % E
     live = jnp.arange(KM) < act.sum()
 
@@ -1557,7 +1570,7 @@ def cont_bounds(bank):
         u = jnp.where(ok, v, BIG if lo else -BIG).reshape(-1)
         u = jnp.sort(u) if lo else -jnp.sort(-u)
         first = jnp.concatenate([jnp.ones(1, bool), u[1:] != u[:-1]])      # distinct values first
-        idx = jnp.nonzero(first, size=TB + 1, fill_value=u.shape[0] - 1)[0]
+        idx = nonzero(first, size=TB + 1, fill_value=u.shape[0] - 1)[0]
         w = u[idx]
         over |= (w[TB] != (BIG if lo else -BIG))
         out.append(w[:TB])
@@ -1611,7 +1624,7 @@ def refresh_b(bank, prev, s, frac=8):
         return jax.vmap(lambda x: refresh(bank, x, fus=False))(s)
 
     def sub(s):  # the whole state is rewritten: rewriting only the refresh fields is slower (measured on CPU)
-        idx = jnp.nonzero(d, size=k, fill_value=nb)[0]
+        idx = nonzero(d, size=k, fill_value=nb)[0]
         part = ref(jax.tree.map(lambda x: x[jnp.minimum(idx, nb - 1)], s))
         return jax.tree.map(lambda x, y: x.at[idx].set(y, mode="drop"), s, part)
     s1 = lax.cond(d.sum() > k, ref, lambda s: lax.cond(d.any(), sub, lambda s: s, s), s)
@@ -1625,7 +1638,7 @@ def _second_b(bank, s, s1, k):
     ref = lambda x: jax.vmap(lambda y: refresh(bank, y, fus=False))(x)
 
     def sub(x):
-        idx = jnp.nonzero(d, size=k, fill_value=nb)[0]
+        idx = nonzero(d, size=k, fill_value=nb)[0]
         part = ref(jax.tree.map(lambda y: y[jnp.minimum(idx, nb - 1)], x))
         return jax.tree.map(lambda y, z: y.at[idx].set(z, mode="drop"), x, part)
     return lax.cond(d.sum() > k, lambda x: _where(d, ref(x), x), lambda x: lax.cond(d.any(), sub, lambda x: x, x), s1)
@@ -1671,7 +1684,7 @@ def fusion_ok(bank, s):
         return fusion_sub_ok(bank, s)
     n = s.cid.shape[0]
     want = (s.zone == Z_EXTRA) & (s.k_fmn > 0)
-    idx = jnp.nonzero(want, size=EXK, fill_value=0)[0]
+    idx = nonzero(want, size=EXK, fill_value=0)[0]
     live = jnp.arange(EXK) < want.sum()
     nq = 1 << FK
     q = jnp.arange(nq)
@@ -1716,7 +1729,7 @@ def fus_picks(bank, s, f):
     cand = fus_cands(bank, s, f)                                   # [FK, N]
     sel = (s.st & ST_SEL) != 0
     t = sel.sum()
-    chosen = jnp.nonzero(sel, size=FK, fill_value=0)[0]            # cards already chosen, in slot order
+    chosen = nonzero(sel, size=FK, fill_value=0)[0]            # cards already chosen, in slot order
     free = cand & ~sel[None, :]
     sub = jnp.asarray(SUBS, bool)                                  # [Q, FK]
     field = s.zone == Z_MZONE
@@ -1754,7 +1767,7 @@ def fusion_sub_ok(bank, s):
     from fusion import completions
     n = s.cid.shape[0]
     want = (s.zone == Z_EXTRA) & (s.k_fmn > 0)
-    idx = jnp.nonzero(want, size=EXK, fill_value=0)[0]
+    idx = nonzero(want, size=EXK, fill_value=0)[0]
     live = jnp.arange(EXK) < want.sum()
     def one(f):
         cand = fus_cands(bank, s, f)
@@ -1774,7 +1787,7 @@ def fusion_sub_picks(bank, s, f):
     eligible = (bank.fsub[s.cid[f]] & (1 << jnp.arange(FK))) != 0
     sel = (s.st & ST_SEL) != 0
     t = sel.sum()
-    chosen = jnp.nonzero(sel, size=FK, fill_value=0)[0]
+    chosen = nonzero(sel, size=FK, fill_value=0)[0]
     field = s.zone == Z_MZONE
     plain, enhanced, plain_field, enhanced_field = completions(cand & ~sel[None, :], subs & ~sel, field,
                                                                bank.fsub[s.cid[f]], jnp.arange(n))
@@ -1966,7 +1979,7 @@ def synchro_ok(bank, s):
     is always freed. O(EXK x (N + LVMAX log SMAX))."""
     n = s.cid.shape[0]
     want = (s.zone == Z_EXTRA) & (s.k_syn != 0) & (s.owner == s.dec_player)
-    idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
+    idx = nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     lvs = jnp.arange(LVMAX + 1)
     lv = jnp.clip(s.k_level, 0, LVMAX)
@@ -2026,7 +2039,7 @@ def xyz_ok(bank, s):
     """[N] xz_c: Xyz monsters of the Extra Deck that can be Summoned (at least xct possible materials). O(EXK x N)."""
     n = s.cid.shape[0]
     want = (s.zone == Z_EXTRA) & (s.k_xct > 0) & (s.owner == s.dec_player)
-    idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
+    idx = nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     oks = jax.vmap(lambda c, ok: ok & (xyz_mats(bank, s, c).sum() >= bank.xct[s.cid[c]]))(idx, live)
     return set_unique(jnp.where(live, idx, n), oks, n)
@@ -2246,7 +2259,7 @@ def link_ok(bank, s):
     """[N] lz_c: Link monsters of the deciding player's Extra Deck that can be Summoned now. O(EXP x (N + 128 x 7))."""
     n = s.cid.shape[0]
     want = (s.zone == Z_EXTRA) & (s.k_lmax > 0) & (s.owner == s.dec_player)
-    idx = jnp.nonzero(want, size=EXP, fill_value=0)[0]
+    idx = nonzero(want, size=EXP, fill_value=0)[0]
     live = jnp.arange(EXP) < want.sum()
     tab = link_table(bank, s, s.dec_player)
 
@@ -2303,7 +2316,7 @@ def refresh_ex_b(bank, s, mask, frac=8):
         return s
 
     def sub(s):
-        idx = jnp.nonzero(mask, size=k, fill_value=nb)[0]
+        idx = nonzero(mask, size=k, fill_value=nb)[0]
         part = ref(jax.tree.map(lambda x: x[jnp.minimum(idx, nb - 1)], s), idx < nb)
         return jax.tree.map(lambda x, y: x.at[idx].set(y, mode="drop"), s, part)
     full = lambda s: _where(mask, ref(s, mask), s)
@@ -2840,7 +2853,7 @@ def auto_pass(bank, s):
     a full round of step (apply, settle, legal, forced). Same game: A_PASS also plays pass_priority."""
     cand = act_cand(bank, s)
     nc = cand.sum()
-    ce, ch = jnp.nonzero(cand, size=KA, fill_value=0)
+    ce, ch = nonzero(cand, size=KA, fill_value=0)
     valid = (jnp.arange(KA) < nc) & (nc <= KA) & (s.dec == D_CHAIN) & (s.wk != W_TRIG) & ~s.done
     okc = jax.vmap(lambda h, e, active: act_ok(bank, s, h, e, s.dec_player, enabled=active))(ch, ce, valid) & valid
     return (s.dec == D_CHAIN) & (s.wk != W_TRIG) & ~s.done & ((nc == 0) | ((nc <= KA) & ~okc.any()))
@@ -2915,7 +2928,7 @@ def legal(bank, s, fus=True):
         return remaining.any() & (rounds < ACT_ROUNDS)
     def batch(carry):
         remaining, accepted, rounds = carry
-        ce, ch = jnp.nonzero(remaining, size=KC, fill_value=0)
+        ce, ch = nonzero(remaining, size=KC, fill_value=0)
         valid = jnp.arange(KC) < remaining.sum()
         passed = jax.vmap(lambda h, e, active: act_ok(bank, s, h, e, p, enabled=active))(ch, ce, valid) & valid
         hit = onehot(ce, E)[:, :, None] & onehot(ch, n)[:, None, :]          # [KC, E, N]
@@ -3273,7 +3286,7 @@ def step_batch(bank, s, a, frac=0.0, stats=False):
         full = lambda s: jax.vmap(lambda s: auto_pass(bank, s))(s)
 
         def sub(s):
-            idx = jnp.nonzero(mask, size=ks, fill_value=n)[0]
+            idx = nonzero(mask, size=ks, fill_value=n)[0]
             part = full(jax.tree.map(lambda x: x[jnp.minimum(idx, n - 1)], s))
             return jnp.zeros(n, bool).at[idx].set(part, mode="drop")
         r = lax.cond(mask.sum() > ks, full, lambda s: lax.cond(mask.any(), sub, lambda s: jnp.zeros(n, bool), s), s)
@@ -3350,7 +3363,7 @@ def step_batch(bank, s, a, frac=0.0, stats=False):
 
     def body(carry):  # following rounds: only the games that have a forced action, in a sub-batch of B/4 (the
         s, m, f, i, k = carry  # others wait for the next round; after the first round, ~30% of the games have one)
-        idx = jnp.nonzero((f >= 0) & ~s.done, size=ks, fill_value=nb)[0]
+        idx = nonzero((f >= 0) & ~s.done, size=ks, fill_value=nb)[0]
         g = lambda x: x[jnp.minimum(idx, nb - 1)]
         ss, ms, fs, k = rnd(jax.tree.map(g, s), g(m), jnp.where(idx < nb, g(f), -1), k)
         put = lambda x, y: x.at[idx].set(y, mode="drop")
